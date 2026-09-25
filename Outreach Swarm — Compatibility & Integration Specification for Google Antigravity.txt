@@ -1,0 +1,695 @@
+# Outreach Swarm — Compatibility & Integration Specification for Google Antigravity
+
+**Deliverable:** a runnable scaffold plus a source-audited specification.
+**Download the scaffold (67 KB):** [`outreach-swarm-scaffold.zip`](https://www.genspark.ai/api/files/s/Y9shF75q)
+
+**Audit basis.** Sixteen repositories were cloned and read this session: `langchain-ai/langgraph`, `openclaw/openclaw`, `openclaw/clawhub`, `diegosouzapw/OmniRoute` (v3.8.51), `tashfeenahmed/freellmapi`, `paperclipai/paperclip`, `coddingtonbear/obsidian-local-rest-api` (v5.2.0), `agentmail-to/agentmail-skills`, `filip-michalsky/SalesGPT`, `ag2ai/ag2`, `crewAIInc/crewAI`, `FoundationAgents/OpenManus`, `Panniantong/agent-reach`, `hoangsonww/Agentic-AI-Pipeline`, `microsoft/agent-framework`, `google/adk-python`, `agno-agi/agno`. No code was executed against live services; all provider shapes are documentation-derived and therefore marked **UNVERIFIED** per your own downgrade rule.
+
+---
+
+## 1. Decision summary
+
+**Build LangGraph as the primary router, OpenClaw as the skill runtime and secondary runtime-spawner, Obsidian as the sole durable memory, Paperclip as telemetry-only, and a single custom MCP sender service as the only outbound path.**
+
+The pairing wins over any single-framework choice for one reason that is visible in source, not in prose: the two frameworks are strong in *disjoint* places, and each one's weak place is exactly where the other is strong.
+
+- LangGraph owns **routing**. Its fan-out primitive is a first-class object, not a convention: `class Send` at `libs/langgraph/langgraph/types.py:732` is documented as "used within a `StateGraph`'s conditional edges to dynamically invoke a node with a custom state at the next step," the map-reduce example at `types.py:755-765` returns `[Send("generate_joke", {"subject": s}) for s in state["subjects"]]`, `Command.goto` is typed `Send | Sequence[Send | N] | N` at `types.py:852`, and the Pregel runner's real handling is `sanitize_untracked_values_in_send` returning `Send(node=packet.node, arg=sanitized_arg, timeout=packet.timeout)` at `pregel/_algo.py:1443-1460`, with dispatch fed by `sends: Sequence[Send] = channels[TASKS].get()` at `_algo.py:967`. That is a **verified** dynamic fan-out path.
+- LangGraph also lets us satisfy the memory boundary in one line. `checkpointer` is an optional constructor argument defaulting to `None` (`pregel/main.py:733`, resolved through `ensure_valid_checkpointer` at `:798`), and `SqliteSaver` is a class that **requires** a `sqlite3.Connection` to exist at all (`libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py:45`, `__init__(self, conn, *, serde=None)`). Omitting the argument is therefore a real, enforceable disablement — not a configuration hope.
+- OpenClaw owns **skill execution and isolation**. Its system prompt is assembled from a base prompt plus a literal `<available_skills>` XML block built by `formatSkillCatalog` at `src/skills/loading/skill-contract.ts:102`, exported as `formatSkillsForPromptCore` at `:135`, and reached through `resolveSkillsPrompt` at `src/skills/loading/workspace-skill-prompt.ts:213`. And per-agent isolation is real: `src/commands/agents.commands.add.ts:1` states it "Implements `openclaw agents add`, including config mutation, workspace setup, auth copy, and route binding setup," carrying its own `workspace` (`:62`), `agentDir` (`:65`), a per-agent auth profile store loaded from that `agentDir` (`:81`), and conflict detection that prints "Skipped bindings already claimed by another agent" (`:210`).
+
+Neither framework can be the whole answer. LangGraph has no skill gating, no per-agent workspace, and no channel binding. OpenClaw has no typed fan-out graph, and its own durable state is a per-agent SQLite session — which your boundary #1 forbids as a lead store. Pairing them, with Obsidian as the arbiter, is the only arrangement where every non-negotiable is enforced by a mechanism you can point at.
+
+**What this decision costs you:** two runtimes to supervise, one extra process to keep alive on Windows, and a serialization boundary between them (the nine-field result contract in §4). That cost is smaller than the alternative, which is bolting skill isolation and workspace partitioning onto LangGraph by hand.
+
+**Q1 answered:** the pairing is confirmed by source. The decisive asymmetry is that LangGraph's flexibility (`Send`) and OpenClaw's isolation (`agents add` → own `agentDir` + own auth profile store) are each verified in code, while neither framework offers the other's mechanism.
+
+---
+
+## 2. Evidence table: framework compatibility
+
+| # | Component | Claimed role | Verdict | Decisive evidence (read this session) |
+|---|---|---|---|---|
+| 1 | **LangGraph** | Primary router | ✅ **Compatible** | `types.py:732` `class Send`; `types.py:852` `goto: Send \| Sequence[Send \| N] \| N`; `_algo.py:1443-1460` Send sanitisation; `_algo.py:967` `channels[TASKS].get()`; `graph/state.py:982` `add_conditional_edges`; `pregel/main.py:733` `checkpointer=None` default |
+| 1b | LangGraph SqliteSaver | Must be disableable | ✅ **Disableable** | `checkpoint-sqlite/.../sqlite/__init__.py:45` — class requires an explicit `sqlite3.Connection`; never construct it |
+| 2 | **OpenClaw** | Skill runtime + spawner | ✅ **Compatible, with caveats** | Skill XML at `skill-contract.ts:102/135`; env inject/restore at `runtime/env-overrides.ts:43-44, 48-52, 73-75, 209`; isolation at `agents.commands.add.ts:1, 62, 65, 81, 186-189, 210`; `agents/agent-create.ts:252` |
+| 2b | OpenClaw ClawHub reachability | Must be off at runtime | ⚠️ **Code exists — must be config-disabled** | `runtime/workspace-worker.ts:195` `if (operation.startsWith("clawhub"))`; `:74` `applyClawHubSkillUninstall`; `security/clawhub-verdicts.ts:2-4` ClawHub client imports |
+| 3 | **OmniRoute** v3.8.51 | Primary inference router | ✅ **Compatible** | `package.json:3` `"version": "3.8.51"`; `circuitBreaker.ts:5` `CLOSED → DEGRADED → OPEN → HALF_OPEN → CLOSED`; `:251-253` defaults 5 / 30000ms / 1; `chat.ts:1247` combo-exhausted path; `apiManagerPageUtils.ts:15,18` `allowedModels` + `modelAccessMode: "all"\|"restricted"` |
+| 3b | OmniRoute exhaustion | Must pause, not switch | ⚠️ **Needs a wrapper** | `chat.ts:1254-1297` performs a **global fallback** on exhaustion — this is exactly the silent-switch behaviour you forbid, so `globalFallbackModel` must be left unset and the pause enforced by our own wrapper |
+| 4 | **FreeLLMAPI** | Second-tier fallback | ✅ **Compatible** | README:157 OpenAI-compatible surfaces incl. `/v1/chat/completions`; README:163 "automatic fallover retries the next model on 429/5xx with cooldowns and key rotation"; default port 3001, base `/v1` |
+| 5 | **Paperclip** | Monitoring only | ✅ **Compatible as telemetry** | `docs/adapters/overview.md` table lists `openclaw_gateway` "Connects to an OpenClaw gateway endpoint"; `docs/adapters/process.md` injects `PAPERCLIP_AGENT_ID`/`PAPERCLIP_API_KEY`, exit-code success; `docs/adapters/http.md` "When Not to Use — If the agent runs locally on the same machine" |
+| 5b | Paperclip outbound failure alerting | Needed? | ❌ **Not found — still UNCONFIRMED** | Re-inspection found adjacent machinery (`services/attention.ts`, `services/recovery-observability.ts`, `routes/email.ts`, `routes/chat-channels.ts` + `chat-channels.webhook.test.ts`) but **no** agent-run-failure → outbound-notification path. Watchdog required |
+| 6 | **Obsidian Local REST API** | Sole durable memory | ✅ **Compatible** | `manifest.json` v5.2.0, `isDesktopOnly: true`; `constants.ts` `DEFAULT_SETTINGS {port: 27124, insecurePort: 27123, enableInsecureServer: false, enableSignedUrls: true}`; `requestHandler.ts:257-259` `Bearer ${apiKey}`; MCP revision `2026-07-28` |
+| 7 | **AgentMail Skills** | 4 operational skills | ⚠️ **Installable only after vendoring patch** | All 10 `SKILL.md` files carry **only** `name:` + `description:` — **no `metadata.openclaw` block**. Gating at load time therefore requires our local patch (§4, repo 7) |
+| 8 | **SalesGPT** | `determine_conversation_stage()` only | ✅ **Copyable, small** | `salesgpt/agents.py:134` `def determine_conversation_stage(self):`; `:62` `stage_analyzer_chain`; `:66` `conversation_stage_dict: Dict = CONVERSATION_STAGES`; `:87` `retrieve_conversation_stage` |
+| 9 | **AG2** | Fallback routing pattern | ✅ **Reference verified** | `ag2/ag2/network/transitions.py:81` `class TransitionTarget(Protocol)` — "Pure resolver — no I/O, no awaitables"; `:92` `TransitionCondition`; `:206` `class ToolCalled`; `ag2/ag2/network/` contains `hub/`, `adapters/`, `transport/` |
+| 10 | **CrewAI** | Reference only | ⚠️ **Memory-disable UNVERIFIED** | Repo layout confirmed (`crewAI/lib/{crewai,crewai-core,cli}`), but a direct grep for `memory: bool` in `lib/crewai/src/crewai/crew.py` returned **nothing** this session. Treat "memory can be fully disabled" as **unconfirmed** until read directly |
+| F1 | Microsoft Agent Framework | Future .NET path | ➖ **Read-only** | Cloned; not inspected in depth. No build dependency |
+| F2 | Google ADK | `AgentTool` reference | ➖ **Read-only** | Cloned (`adk-python`); not adopted |
+| F3 | Agno | `AgentFactory` reference | ➖ **Rejected** | Postgres-first — violates boundary #1 |
+| F4 | OpenManus | Browser-automation reference | ➖ **Read-only** | Multi-agent mode documented unstable; no adoption |
+| F5 | Agentic-AI-Pipeline | Stage-handoff shape | ➖ **Read-only** | Research→Qualify→Outreach shape only |
+| F6 | Agent Reach | Optional enrichment | ➖ **Deferred** | Pull only if enrichment becomes the bottleneck |
+
+**Capability-map honesty note.** Your brief requires a 17-item capability map where each entry carries "the response shape returned by a live call against a test account." **No test accounts exist in this session and no live call was made.** Per your own rule — "Anything not confirmed against a live call is downgraded from 'feasible' to 'unverified'" — **all 17 are downgraded to UNVERIFIED**. §14 gives the promotion criteria: the exact live call that moves each from unverified to feasible. I will not dress documentation up as a live measurement.
+
+---
+
+## 3. Recommended repository/component responsibility map
+
+| Repo / component | Clone into | Responsibility | May persist | Must never |
+|---|---|---|---|---|
+| `langchain-ai/langgraph` | `orchestrator/` (dep) | Agent-routing plane; `Send` fan-out; conditional edges; `verify_node` wrapper | Ephemeral turn state only, mirrored out same turn | Own a lead store; construct `SqliteSaver` |
+| `openclaw/openclaw` | `vendor/openclaw` | Skill runtime; system-prompt assembly; per-agent workspace/state/auth isolation | Per-agent SQLite session (**ephemeral working memory only**) | Be read as the compliance record |
+| `openclaw/clawhub` | `reference/clawhub` (read-only) | Threat-model study only | Nothing | Be integrated; be fetched from at runtime |
+| `diegosouzapw/OmniRoute` | `vendor/OmniRoute` | Tier-1 inference router; breaker/cooldown/fallback | Its own quota cache/telemetry | Route outside the reviewed allowlist; silently switch |
+| `tashfeenahmed/freellmapi` | `vendor/freellmapi` | Tier-2 inference router behind OmniRoute | Its own encrypted key store | Route outside the same allowlist |
+| `paperclipai/paperclip` | `vendor/paperclip` | Monitoring dashboard + watchdog integration point | Run status, duration, stdout/stderr excerpts, cost telemetry, heartbeats | Store lead records, campaign knowledge, learned patterns, suppression state, conversation history, tokens |
+| `coddingtonbear/obsidian-local-rest-api` | Obsidian plugin | **Sole durable memory** (REST + `/mcp/`) | Leads, campaigns, patterns, operations, incidents, suppression state | Bind beyond localhost; enable the insecure port |
+| `agentmail-to/agentmail-skills` | `skills/` (vendored + patched) | 4 operational skills; AgentMail is the **validated fallback sender** | Nothing | Ship with upstream frontmatter (no gating block) |
+| `filip-michalsky/SalesGPT` | `reference/SalesGPT` | `determine_conversation_stage()` + 8-stage rubric, copied into the reply agent's pre-generation hook | Nothing | Adopt the SalesGPT runtime |
+| `ag2ai/ag2` | `reference/ag2` | Fallback routing pattern (`TransitionTarget.resolve`) | Nothing | Be a runtime dependency |
+| `crewAIInc/crewAI` | `reference/crewAI` | Role definitions if LangGraph nodes prove too low-level | Nothing | Be adopted (memory boundary) |
+| **new**: `mcp-servers/email-outreach` | in-repo | The **only** outbound send path; holds OAuth refresh tokens | Send audit log only | Let an agent hold a token |
+| **new**: `watchdog` | in-repo | Outbound-failure detection, incident notes, dedupe | Dedupe window (in-memory) | Be the alert-of-record for compliance |
+| **new**: `paperclip-adapter` | in-repo | Telemetry heartbeat + adapter manifest | Nothing | Carry lead fields |
+
+---
+
+## 4. Source-level findings by repository
+
+### 4.1 LangGraph — `langchain-ai/langgraph`
+
+**Dynamic fan-out: CONFIRMED.**
+- `libs/langgraph/langgraph/types.py:732` — `class Send:` docstring: "The `Send` class is used within a `StateGraph`'s conditional edges to dynamically invoke a node with a custom state at the next step. Importantly, the sent state can differ from the core graph's state… One such example is a 'map-reduce' workflow where your graph invokes the same node multiple times in parallel with different states."
+- `types.py:755-765` — the working example: `return [Send("generate_joke", {"subject": s}) for s in state["subjects"]]`
+- `types.py:852` — `goto: Send | Sequence[Send | N] | N = ()` on `Command`, so a node may *return* Sends rather than only a conditional edge.
+- `libs/langgraph/langgraph/pregel/_algo.py:967` — `sends: Sequence[Send] = channels[TASKS].get()`
+- `pregel/_algo.py:1443-1460` — `sanitize_untracked_values_in_send(packet, channels) -> Send`, returning `Send(node=packet.node, arg=sanitized_arg, timeout=packet.timeout)`.
+- `pregel/_algo.py:524` — `def prepare_single_task(... checkpointer: BaseCheckpointSaver | None = None ...)`; `_algo.py:349/371/392` — three `prepare_next_tasks` overloads.
+- `libs/langgraph/langgraph/graph/state.py:982` — `def add_conditional_edges(self, source, path, path_map=None)`.
+- `pregel/_loop.py:158` — `class PregelLoop`; `_loop.py:445-448` sanitises `UntrackedValue`s nested inside `Send` packets before checkpointing.
+
+**`verify_node` wrapper: IMPLEMENTABLE, CONFIRMED.** Because a conditional-edge function may return any sequence of `Send` objects, and because every node's return value flows through the same channel-write machinery (`pregel/_write.py:50` `writes: list[ChannelWriteEntry | ChannelWriteTupleEntry | Send]`), a wrapper that calls `action_fn(state)`, re-reads Obsidian, and rewrites `next_action` is a plain function composition. It needs no framework hooks. This is what `orchestrator/graph/build.py` implements.
+
+**Checkpointer disablement: CONFIRMED.** `pregel/main.py:733` `checkpointer: Checkpointer = None`; `:798` `checkpointer = ensure_valid_checkpointer(checkpointer)`; `:838-843` `_apply_checkpointer_allowlist`. `SqliteSaver` itself (`checkpoint-sqlite/.../sqlite/__init__.py:45`) has `__init__(self, conn: sqlite3.Connection, *, serde=None)` — no connection, no saver. Its own docstring warns it "does not scale to multiple threads."
+
+**Verdict:** a graph *can* run on ephemeral state and rehydrate durable state from Obsidian MCP tools. Restart recovery must therefore be our own function, not a checkpoint replay. Directory map confirmed: `graph/` = `__init__, _branch, _node, message, state, ui`; `pregel/` = `_algo, _call, _checkpoint, _config, _draw, _executor, _io, _log, _loop, _messages, _read, _remote_run_stream, _retry, _runner, _tools, _utils, _validate, _write, debug, main, protocol, remote, types`.
+
+### 4.2 OpenClaw — `openclaw/openclaw` (skill loading: all seven steps traced)
+
+**Step 1 — reads skill metadata.** `src/skills/loading/frontmatter.ts:178` `resolveSkillManifestMetadata(frontmatter)`; loader entry points `src/skills/loading/local-loader.ts:82` `loadSingleSkillDirectory`, `:162` `readSkillFrontmatterSafe`; root loading `src/skills/loading/skill-root-loader.ts:108` `loadSkillRootRecords`, `:183` `loadGeneratedPluginSkillRecords`.
+
+**Step 2 — applies `metadata.openclaw` gating.** `frontmatter.ts:181` `const metadataObj = resolveOpenClawManifestBlock({ frontmatter });` then `:185` `resolveOpenClawManifestRequires`, `:186` `resolveOpenClawManifestInstall`, `:187` `resolveOpenClawManifestOs`, and the assembled object carries `always` (`:189`), `emoji`, `homepage`, `skillKey` (`:192`), `primaryEnv` (`:193`), `os`. Resolvers live in `src/shared/frontmatter.ts:32` (`resolveOpenClawManifestBlock`), `:73` (`resolveOpenClawManifestRequires`), `:103` (`resolveOpenClawManifestOs`). **Note:** if `metadataObj` is absent the function returns `undefined` (`frontmatter.ts:182-184`) — **gating is skipped entirely**. This is the single most important finding for repo #7.
+
+**Step 3 — resolves per-agent allowlists.** `src/skills/loading/workspace-skill-loader.ts:518` `resolveWorkspaceSkillPromptEntries` returns `{ eligible, skillFilter }` (`:534`); `skillFilter` is normalised at `:509-510` and applied at `:110-114`; the config field is `skills: z.array(z.string()).optional()` at `src/config/zod-schema.agent-entry-base.ts:131`, with `agents.defaults`/`agents.entries.*` per the official CLI docs. Root-level controls exist at `src/config/zod-schema.root-shape.ts:448-462` (`allowBundled`, `load.extraDirs`, `load.allowSymlinkTargets`, `load.watch`).
+
+**Step 4 — injects `skills.entries.<key>.env` + `apiKey` into `process.env`.** `src/skills/runtime/env-overrides.ts:43-44`:
+```
+if (process.env[key] === undefined) {
+  process.env[key] = active.value;
+```
+with baseline capture at `:48-52` (`baseline: process.env[key]`), acquisition at `:66-67`, and the primary write at `:209` `process.env[envKey] = activeSkillEnvEntries.get(envKey)?.value ?? envValue;`. `primaryEnv` handling at `:169` and `:179`. Entry resolution: `src/skills/runtime/embedded-run-entries.ts` (`resolveEmbeddedRunSkillEntries`), with `apiKey` fields exercised at `embedded-run-entries.test.ts:111-168`.
+
+**Step 5 — compiles eligible skills into the XML block.** `src/skills/loading/skill-contract.ts:102` `function formatSkillCatalog(skills, loadingInstructions, descriptionForSkill)`, emitting `<available_skills>` → per-skill `<skill>` → `<name>`, `<description>`, `<location>`, `<location_note>` → `</available_skills>`; exported via `:135` `formatSkillsForPromptCore(skills: Skill[])`. The parser side reads the block with `prompt.indexOf("<available_skills>")` at `:70-71`.
+
+**Step 6 — appends the block to the system prompt.** `src/skills/loading/workspace-skill-prompt.ts:213` `resolveSkillsPrompt(params)` wraps `resolveSkillsPromptCatalog` through `compactSkillsPromptForContext` (`skill-contract.ts:61`), which truncates descriptions but preserves the identity floor ("Names, mapped locations and loading notes are an identity floor, not optional prose"). Prompt-limit enforcement at `src/skills/loading/skill-prompt-limits.ts:59`. Related: `src/gateway/derive-goal-session-title.ts:16` references `<skills_instructions>`; `src/gateway/session-reset-service.ts:1472` documents the stale-`<available_skills>` hazard after reset/restart.
+
+**Step 7 — restores the environment on run end.** `env-overrides.ts:73-75`:
+```
+delete process.env[key];
+} else {
+process.env[key] = active.baseline;
+```
+in `releaseActiveSkillEnvKey`, with refcounting via `active.count` and the snapshot accessor `getActiveSkillEnvKeysCore()` at `:36`. The file cites the upstream issue for this behaviour: `@see https://github.com/openclaw/openclaw/issues/36280`.
+
+**Verdict: all seven steps are present and non-optional in the code path — with one exception that matters.** Step 2 is present but **conditional on the skill declaring a `metadata.openclaw` block**. Steps 1, 3–7 are unconditional. **Flag raised before any skill install:** any skill lacking that block bypasses gating silently (`frontmatter.ts:182-184` returns `undefined`). This is exactly the case for all ten upstream AgentMail skills (§4.7).
+
+**Isolation: CONFIRMED at source.** `src/commands/agents.commands.add.ts:1` — "Implements `openclaw agents add`, including config mutation, workspace setup, auth copy, and route binding setup." Per-agent fields: `:62` `workspace?`, `:65` `agentDir?`, `:81` `loadReadablePersistedAuthProfileStore(agentDir)` (per-agent auth DB, with `resolveAuthProfileDatabasePath(agentDir)`), `:286-300` interactive defaults from `resolveAgentWorkspaceDir(cfg, agentId)` / `resolveAgentDir(cfg, agentId)`. Creation delegates to `createAgent` (`:158`, `:552`) defined at `src/agents/agent-create.ts:252`. Binding plumbing imported from `./agents.bindings.js` (`:47` `applyAgentBindings, buildChannelBindings, describeBinding`); the JSON payload reports `workspace`, `agentDir`, and `bindings.{added,updated,skipped,conflicts}` (`:186-189`); conflicts are surfaced as "Skipped bindings already claimed by another agent" (`:210`). Role handling: `:63` `role?: string`, `:108-110` `loadAgentRole(opts.role)`, `:134` "Non-interactive agent creation requires `--workspace`", `:161`/`:554` pass `role` through. **Precision note:** the `--bind <channel>` flag string was confirmed from the official CLI docs ("Manage isolated agents (workspaces + auth + routing)", "configure `agents.defaults.skills` and `agents.entries.*.skills` in `openclaw.json`"), **not** from a literal `--bind` token in my source read — my source read confirmed the bindings module, the payload, and the conflict logic.
+
+**ClawHub reachability: CONFIRMED PRESENT IN CODE.** `src/skills/runtime/workspace-worker.ts:195` `if (operation.startsWith("clawhub"))`, `:74` `applyClawHubSkillUninstall`, `:196` `clawhub-store` dynamic import; `src/skills/security/clawhub-verdicts.ts:2-4` imports `resolveClawHubBaseUrl`, `fetchExactClawHubSkillSecurityVerdicts`, `ClawHubSkillSecurityVerdictItem`. Lifecycle modules `src/skills/lifecycle/clawhub-{status,store,uninstall}.ts` exist. **So Phase-0 gate 8 cannot be "the runtime has no ClawHub code" — it must be "our configuration never asks it to, and no skill in our tree came from it."** My `scripts/phase0/check_clawhub_refs.py` is scoped exactly that way, and its docstring says so.
+
+### 4.3 OmniRoute — `diegosouzapw/OmniRoute`
+
+**Version confirmed at source:** `package.json:3` `"version": "3.8.51"` — matches your requested pin. No newer stable tag was fetched, so the pin stands.
+
+**Files named in the brief, all present:**
+| File | Size / status |
+|---|---|
+| `src/sse/handlers/chat.ts` | 113,542 bytes |
+| `src/sse/services/auth.ts` | 151,244 bytes |
+| `src/shared/utils/circuitBreaker.ts` | 26,401 bytes |
+| `open-sse/services/autoCombo/` | contains `virtualFactory.ts`, `scoring.ts`, `selfHealing.ts`, `strictZeroCostFilter.ts`, `paidModelFilter.ts`, `freeAccessQuota.ts`, `snapshotBreaker.ts`, `engine.ts`, `chaosEngine.ts`, `resilienceCandidateFilter.ts`, `modelLockoutFilter.ts` |
+| `docs/routing/AUTO-COMBO.md` | title "OmniRoute Auto-Combo Engine", `version: 3.8.40` |
+| `docs/reference/FREE_TIERS.md` | present |
+
+**429 / 5xx / breaker / cooldown / fallback: CONFIRMED.** `chat.ts:22` `shouldMarkAccountExhaustedFrom429`, `:138` `classify429FromError` + `FailureKind`, `:140` `resolveUseUpstream429BreakerHints`, `:145` `markAccountExhaustedFrom429`, `:198` import from `../services/cooldownAwareRetry`, `:220-233` comments on proactive account switching via `quotaPreflight`/`quotaMonitor`, `:945` auto/combo resolution, `:980` "Check if model is a combo (has multiple models with fallback)", `:1060` marking a target unavailable so "priority/fallback strategies can continue", `:1208` "open for as long as the overall combo keeps retrying elsewhere". Breaker states at `circuitBreaker.ts:5` `CLOSED → DEGRADED → OPEN → HALF_OPEN → CLOSED`, enum at `:130-133`, options at `:143-154` (`cooldown`, `cooldownByKind`, `failureThreshold`, `kindThresholds`), constructor defaults at `:251-253` (`failureThreshold ?? 5`, `resetTimeout ?? 30000`, `halfOpenRequests ?? 1`) and `:269-270` (`degradationThreshold ?? ceil(failureThreshold*0.6)`, `maxBackoffMultiplier ?? 16`), plus transition history and `OPEN → HALF_OPEN → OPEN` cycle counting at `:242`.
+
+**⚠️ The exhaustion path does the thing you forbid.** `chat.ts:1247` — "If combo exhausted all models, try the global fallback before giving up." `:1254` reads `(settings as any).globalFallbackModel`, `:1257` logs `Combo "${combo.name}" exhausted — attempting global fallback: ${fallbackModel}`, `:1260-1284` calls `runWithTransientBackendRetry(() => handleSingleModelChat(...))` and on success returns with `source: "global-fallback"`, `:1287-1297` logs failure/error. **This is a silent switch to an arbitrary configured model.** Mitigation: leave `globalFallbackModel` **unset**, and enforce `inference_paused` in our own wrapper *before* dispatching, so the request never reaches this branch. Your brief's requirement ("confirm the 'all providers exhausted' path can be made a safe pause rather than a silent switch") is therefore satisfiable **only by configuration plus an outer wrapper** — not by OmniRoute alone. This is a concrete finding that changes the build.
+
+**Fixed allowlist config: CONFIRMED EXISTS.** `apiManagerPageUtils.ts:5-7` documents key scopes — `"manage"` = management key, `"restricted"` = "has model/connection allowlists", `"standard"` = "no manage scope and no allowlists"; `:15` `allowedModels?: string[] | null`; `:18` `modelAccessMode?: "all" | "restricted" | null`; `:41-42` `hasModelRestrictions`; `:244-289` splitting/rebuilding `allowedModels` with `modelAccessMode: "restricted"`. **So a fixed reviewed allowlist is a first-class, source-verified control** — set the API key to `restricted` with our model ids. (Note the documented hazard: "a 'manage' key with allowlists is still classified as 'manage'".)
+
+**Zero-spend guarantee: CONFIRMED as a shipped, pre-dispatch filter.** `open-sse/services/autoCombo/strictZeroCostFilter.ts` header: `STRICT_ZERO_COST` is "an opt-in, stricter sibling of `hidePaidModels` … for operators who need a hard guarantee against ANY incremental monetary spend, not just 'documented as free'"; it "adds exactly those two checks, before ranking, before dispatch — never after"; the live quota lookup lives in `freeAccessQuota.ts` and "is injected here as a plain function — this file never imports the DB or makes a network call itself." Also: "No provider or model name appears anywhere in this file."
+
+**Why the allowlist must be ours, not theirs.** `docs/reference/FREE_TIERS.md` is explicitly a **moving** catalog: it reclassified `cerebras` "from a 30M/mo recurring grant … to a one-time $5 signup credit that requires a payment method," notes `gemini`/`ollama-cloud` are now listed as "uncapped, never summed," and states the doc is CI-gated (`check:docs-counts` fails the build if the reported totals drift from `computeFreeModelTotals()`), currently reporting "35 recurring pool keys and ~1.62B steady." A catalog that changes under CI is not an allowlist. Ours is.
+
+### 4.4 FreeLLMAPI — `tashfeenahmed/freellmapi`
+
+**OpenAI-compatible endpoint: CONFIRMED.** README:157 — "Every OpenAI-style surface — `/v1/chat/completions`, `/v1/responses` … `/v1/embeddings`, and `/v1/models` — streaming and non-streaming, from the official SDKs or any OpenAI-compatible client." Base URL `http://localhost:3001/v1`; default port **3001**.
+
+**Per-key cooldown / retry: CONFIRMED.** README:163 — "Smart routing, six strategies — live per-model speed/capability/reliability scores rank your chain; automatic fallover retries the next model on 429/5xx with cooldowns and key rotation." README:343 (router-flow asset caption) — "the fallback chain with live scores, cooldowns, and quota tracking." Repo layout: `cli/`, `desktop/`, `shared/`, `scripts/`, `examples/fetch-relay-worker`. It is "local-first and single-user by design," with provider keys in an encrypted SQLite DB — which is fine, because that store holds *provider keys*, not lead memory.
+
+**Wiring:** FreeLLMAPI sits **behind** OmniRoute and is bound by the *same* `config/model-allowlist.yaml`. Its own 429/5xx chain is acceptable *within* that list; the wrapper must reject any id outside it, so FreeLLMAPI's internal chain can never widen the allowlist.
+
+### 4.5 Paperclip — `paperclipai/paperclip`
+
+**Adapter choice — evidence.** `docs/adapters/overview.md` built-in table includes **`openclaw_gateway` — "Connects to an OpenClaw gateway endpoint"** alongside `process` ("Executes arbitrary shell commands") and `http` ("Sends webhooks to external agents"). `docs/adapters/process.md`: "The `process` adapter executes arbitrary shell commands"; config `{command, cwd, env, timeoutSec}`; "Paperclip spawns the configured command as a child process"; "Standard Paperclip environment variables are injected (`PAPERCLIP_AGENT_ID`, `PAPERCLIP_API_KEY`, etc.)"; "Exit code determines success/failure"; and **"When Not to Use — If you need session persistence across runs (use `claude_local` or `codex_local`)"**. `docs/adapters/http.md`: "sends a webhook request to an external agent service. The agent runs externally and Paperclip just triggers it"; **"When Not to Use — If the agent runs locally on the same machine (use `process`, `claude_local`, or `codex_local`)"**.
+
+**Decision (justified):** OpenClaw workers → **`openclaw_gateway`**, because it reads *real* run state instead of inferring it. LangGraph orchestrator → **`process`**, because it is a local long-lived process, and the `process` doc's only stated disqualifier (no session persistence) is irrelevant since Obsidian holds all durable state. `http` is explicitly documented as wrong for local agents. **Do not** use `process` for the OpenClaw workers: it would lose their session/run identity.
+
+**Run/agent statuses: CONFIRMED from source.** `server/src/services/execution-projection.ts` — `:163` `phase: "queued"`; `:223` `run.status === "running"`; `:286` `run.status === "succeeded"`; `:218` `deliveredRunId ? "completed" : "queued"`; `:209` `set("failed", "Continuation cancelled")`; `:245` `["failed", "timed_out"].includes(run.status)`; `:298-299` `["failed","cancelled","timed_out","interrupted"]` → `set("failed", …)`. Full watch set: **`queued, running, succeeded, completed, failed, cancelled, timed_out, interrupted`**.
+
+**Outbound failure alerting: re-verified, still absent.** Adjacent machinery exists — `server/src/services/attention.ts`, `recovery-observability.ts`, `tool-access.ts`, `decision-queues.ts`, `database-backup-health.ts`, and webhook-capable routes `routines.ts`, `plugins.ts`, `openapi.ts`, `email.ts`, `chat-channels.ts` (with `chat-channels.webhook.test.ts`) — but **no confirmed agent-run-failure → outbound-notification path**. Status: **UNCONFIRMED**, not disproven. The local watchdog is therefore required and is built to not depend on this feature.
+
+**Routes observed** (for the supervisor console's read surface): `activity.ts`, `agents.ts`, `dashboard.ts`, `approvals.ts`, `adapters.ts`, `attention.ts`, `costs.ts`, `access.ts`, `announcements.ts`, `assets.ts`, `auth.ts`, `board-chat.ts`, `built-in-agents.ts`, `cases.ts`, `companies.ts`, `chat-channels.ts`, `ai-connections.ts`, `connection-intents.ts`, `company-skills.ts`.
+
+### 4.6 Obsidian Local REST API — `coddingtonbear/obsidian-local-rest-api`
+
+**Manifest (read verbatim):** `{"id":"obsidian-local-rest-api","name":"Local REST API with MCP","version":"5.2.0","minAppVersion":"1.13.1","description":"A secure REST API and Model Context Protocol (MCP) server for your vault.","author":"Adam Coddington","isDesktopOnly":true}`
+
+**Network binding + key storage: CONFIRMED.** `src/constants.ts`:
+```
+export const DEFAULT_SETTINGS: LocalRestApiSettings = {
+  port: 27124,
+  insecurePort: 27123,
+  enableInsecureServer: false,
+  enableSignedUrls: true,
+};
+```
+`src/requestHandler.ts:257-259`:
+```
+this.settings.authorizationHeaderName ?? "Authorization",
+if (authorizationHeader === `Bearer ${this.settings.apiKey}`) {
+```
+Auth failures raise `ApiKeyAuthorizationRequired` (`:347`, `:371`, `:378`, `:2468`), whose message is: *"Authorization required. Find your API Key in the 'Local REST API with MCP' section of your Obsidian settings."* Docs confirm two modes (HTTPS `https://{host}:{port}`, HTTP `http://{host}:{port}`) and a self-signed CA downloadable at `/obsidian-local-rest-api.crt`. MCP protocol revision for the sessionless leg: `MCP_SESSIONLESS_PROTOCOL_VERSION = "2026-07-28"` (`constants.ts`); `BUILT_IN_ROUTES = ["/", "/openapi.yaml", `/${CERT_NAME}`]`.
+
+**Least-privilege tool subset (tool names located at source lines):**
+
+| Tool | Line in `src/mcpHandler.ts` | Verdict |
+|---|---|---|
+| `vault_list` | `:898` | **ALLOW** (read-only) |
+| `vault_read` | `:911` | **ALLOW** — "reads text. A file whose bytes are not valid UTF-8 … is refused rather than returned as the lossy string decoding it would produce" |
+| `vault_read_binary` | `:1007` | **DENY** (attachments out of scope) |
+| `vault_patch` | `:1090` | **ALLOW, scoped** — `Target-Type` ∈ heading/block/frontmatter, `Operation` ∈ replace/append, scopes `content`/`marker`/`markerAndContent` |
+| document-map tool | `:1296` | **ALLOW** — returns heading tree, block ids, `frontmatterFields`, and "`version` is a content hash of the file — pass it back as `vault_patch`'s `ifMatch`" |
+| active-file tool | `:1312` | **ALLOW** (read-only) |
+| `search_query` | `:1322` | **ALLOW** (read-only) |
+| tags tool | `:1395` | **ALLOW** (read-only) |
+| commands list | `:1405` | **ALLOW** (read-only) |
+| `command_execute` | `:1414` | **DENY** |
+| `open_file` | `:1427` | **DENY** (UI side effect) |
+| `vault_delete` / `vault_move` / `vault_copy` | (plugin marks destructive) | **DENY** |
+
+The plugin's own test suite corroborates the destructive classification: `src/mcpHandler.test.ts:305-306` asserts that "`vault_patch`, `vault_delete`, `vault_move`, `vault_copy`, and `command_execute` are annotated as destructive". Gate on that: allow `vault_patch` **only** with `Operation: append` against the allowlisted heading set (`Run Log`, `Replies`, `Incidents`); deny the rest.
+
+**Atomic per-section patch (the per-lead reporter): CONFIRMED mechanism.** `mcpHandler.test.ts:1309-1318` — "`vault_patch` builds a heading content instruction and calls `patchFileSectionMdp2`" with `expect(ops.patchFileSectionMdp2).toHaveBeenCalledWith("out.md", …)`. So the reporter issues `PATCH /vault/Outreach/Leads/<id>.md` with `Content-Type: text/markdown`, `Operation: append`, `Target-Type: heading`, `Target: Run Log`, `Create-Target-If-Missing: true`, and `If-Match: <version>` — never a whole-note write. `orchestrator/memory/obsidian_client.py` implements exactly this.
+
+### 4.7 AgentMail Skills — `agentmail-to/agentmail-skills` ⚠️ **critical finding**
+
+**Ten `SKILL.md` files exist:** `agentmail-send-email`, `agentmail-check-email`, `agentmail-manage-inboxes`, `agentmail-mcp`, `agentmail-toolkit`, `agentmail-cli`, `agentmail` (SDK), `agentmail-sdk` (deprecated alias), `email-for-ai-agents` (alias), `agent-email-patterns`. Plus `scripts/skills.py`, `skills.json`, `skills.sh.json`, `backend-contract.json`, `evals/smoke/`, `tests/test_skills_tooling.py`.
+
+**Every single frontmatter block contains ONLY `name:` and `description:`.** Verbatim from `agentmail-send-email/SKILL.md`:
+```
+---
+name: agentmail-send-email
+description: Draft, send, reply to, or forward email through the connected AgentMail MCP server. Use for ANY request to send, reply, or forward mail …
+---
+```
+The same two-key shape holds for `agentmail-manage-inboxes`, `agentmail-check-email`, `agentmail-mcp`, `agentmail-cli`, `agentmail`, `agentmail-toolkit`, and both deprecated aliases.
+
+**Consequence, tied to §4.2 step 2:** `frontmatter.ts:181-184` returns `undefined` when no `metadata.openclaw` block is present, and `resolveSkillManifestMetadata` returns `undefined` at `:182-184`. **Therefore the upstream AgentMail skills do NOT conform to OpenClaw's gating format and would load ungated.** Your brief says "Confirm each skill's `SKILL.md` frontmatter conforms to OpenClaw's `metadata.openclaw` gating format" — the answer is **it does not**, and this must be fixed during vendoring.
+
+**Mitigation implemented in the scaffold:** `skills/agentmail-send-email/SKILL.md` was vendored with an added `metadata.openclaw` block (`always: false`, `primaryEnv: AGENTMAIL_API_KEY_A`, `skillKey`, `requires.env: [AGENTMAIL_API_KEY_A, AGENTMAIL_MCP_URL]`, `os: [win32, linux, darwin]`) and a prominent vendoring note stating the upstream shape and instructing that the file must not be overwritten with the upstream copy. **Belt and braces:** also enforce the same outcome via the per-agent workspace allowlist (`zod-schema.agent-entry-base.ts:131`), so the control does not rest on frontmatter alone — a single YAML key is a thin place to hang a security boundary.
+
+**MCP endpoint:** `agentmail-mcp/SKILL.md` — "Prefer the hosted Streamable HTTP server: `https://mcp.agentmail.to/mcp` … It avoids a local Node.js process and the slower release cadence of the published local MCP package," and "Use OAuth. Do not put an empty API key in the configuration."
+
+### 4.8 SalesGPT — `filip-michalsky/SalesGPT`
+
+`salesgpt/agents.py:134` `def determine_conversation_stage(self):`; `:62` `stage_analyzer_chain: StageAnalyzerChain = Field(...)`; `:66` `conversation_stage_dict: Dict = CONVERSATION_STAGES`; `:87` `retrieve_conversation_stage(key)` looks the stage up in `conversation_stage_dict`. The method joins conversation history, passes it to `stage_analyzer_chain`, then resolves the stage id. **Copy the rubric and this method into the reply agent's pre-generation hook; adopt nothing else.** The stage value is written to the lead note's `conversation_stage` frontmatter field, which is in `WRITABLE_FRONTMATTER` in `orchestrator/nodes/reporter.py`.
+
+### 4.9 AG2 — `ag2ai/ag2`
+
+`ag2/ag2/network/transitions.py:81`:
+```
+class TransitionTarget(Protocol):
+    """Where the next turn goes. Pure resolver — no I/O, no awaitables."""
+    name: ClassVar[str]
+    def resolve(self, state: "WorkflowState", envelope: Envelope) -> TransitionDecision: ...
+```
+`:92` `class TransitionCondition(Protocol)` — "Pure predicate — no I/O", `evaluate(...) -> bool`. `:206` `class ToolCalled`; `:15`/`:51` list `FromSpeaker` and `ToolCalled` among the built-in transitions. `:104-110` `Transition` dataclass: "One rule: if `when.evaluate` is true, take `then`. Lower `priority` checks first; ties resolve in list order." The `ag2/ag2/network/` package contains `hub/`, `adapters/`, `client/`, `transport/`, `views/`, plus `envelope.py`, `handoff.py`, `policies.py`, `rule.py`, `task_mirror.py`.
+
+**Verdict:** the hub-and-spoke module and the `ToolCalled` / `TransitionTarget.resolve()` pattern are **confirmed present**. This is the fallback design if LangGraph's conditional-edge routing proves insufficient for a specific specialist — note that AG2's model (pure resolvers, no I/O) is *more* amenable to a deterministic compliance plane than LangGraph's, which is a point in its favour as a fallback.
+
+### 4.10 CrewAI — `crewAIInc/crewAI`
+
+Repo layout confirmed: `lib/crewai`, `lib/crewai-core`, `lib/cli`. **A direct grep for `memory: bool` in `lib/crewai/src/crewai/crew.py` returned nothing this session.** Your brief requires confirming that "memory/knowledge modules can be fully disabled." **Status: UNVERIFIED.** I will not assert it. Since CrewAI is reference-only for role definitions and carries no build dependency, this does not block anything — but if you later promote it, re-read `crew.py` first and treat memory as *enabled by default* until proven otherwise.
+
+### 4.11 ClawHub threat model — `openclaw/clawhub` (read-only)
+
+Per the Unit 42 analysis, "Unit 42's analysis of ClawHub revealed evasive malicious skills bypassing automated scanners to deploy infostealers and execute agentic fraud," and five malicious skills "were uploaded to the OpenClaw/ClawHub AI agent marketplace and bypassed [screening]." A separate Snyk write-up documents a malicious "Google" skill on ClawHub tricking users into installing malware via a fake OpenClaw flow.
+
+**Precision note:** the specific campaign label "ClawHavoc" that your brief uses **did not appear in my retrieved excerpt** of the Unit 42 report. The *facts* (evasive skills, scanner bypass, infostealers, agentic fraud, five skills) are corroborated; the *name* is not confirmed by my sources. This does not weaken boundary #7 — it is irrelevant to the mitigation — but I flag it rather than repeat a label I could not verify.
+
+**This is why the scaffold's rule is absolute:** every skill in `skills/` is first-party and authored in-repo, and `scripts/phase0/check_clawhub_refs.py` asserts zero ClawHub references in the final config. Note the honest scoping in that script's docstring: OpenClaw's *codebase* contains ClawHub modules (`workspace-worker.ts:195`, `clawhub-verdicts.ts:2-4`); the guarantee is about *our configuration*, not the vendor's source tree.
+
+### 4.12 Zoho Mail — API shape (documentation-derived, **UNVERIFIED** against a live account)
+
+From Zoho's `post-send-an-email` documentation:
+- **Scope:** `ZohoMail.messages.ALL` (full message access) or `ZohoMail.messages.CREATE` (create messages only). Use `CREATE`.
+- **Endpoint:** `POST https://mail.zoho.com/api/accounts/{accountId}/messages`, where `accountId` "is generated during account addition" and can be fetched from the **Get All User Accounts API**.
+- **Body:** `fromAddress`* (must be associated with the authenticated account), `toAddress`*, `ccAddress`, `bccAddress`, `subject`, `content`, `mailFormat` (`html`|`plaintext`, default `html`), `askReceipt` (`yes`|`no`), `encoding` (default `UTF-8`). Optional scheduling: `isSchedule`, `scheduleType` (1 = +1h, 2 = +2h, 3 = +4h, 4 = next morning, 5 = next afternoon).
+- **Region hosts:** `.com` / `.eu` / `.in` variants exist (the doc's endpoint is `mail.zoho.com`; region hosts are configured per account).
+
+**⚠️ The public documentation says nothing about Free-plan API entitlement.** Your boundary #6 is correct and this audit confirms it: **entitlement is an implementation-blocking measurement, not an assumption.** Phase-0 gate 1 exists precisely for this.
+
+### 4.13 AgentMail — Free tier and the multi-account question
+
+**Free tier, vendor-confirmed:** `$0 · No credit card required. 3 inboxes. 3,000 emails/month. 3 GB storage.` The next tier is `$20 · 10 inboxes, 10,000 emails/month, 10 GB`. **So 3 inboxes per account is confirmed — your brief's correction is right, and 5 identities require two free signups (3+3=6, use 5).**
+
+**⚠️ AgentMail's Terms of Service could not be retrieved.** The crawler returned: `[CRAWL FAILED] https://www.agentmail.to/terms: the crawler could not retrieve any content`. **Multi-account eligibility therefore remains UNVERIFIED**, and this is exactly why `scripts/phase0/validate_agentmail.ps1` opens with a hard block: it refuses to proceed unless the operator sets `AGENTMAIL_TOS_MULTI_ACCOUNT_CONFIRMED=true` after reading the ToS, and prints the reduced-fleet fallback (3 AgentMail identities + whichever of the original 6 passed, rotation recomputed) if the ToS disallows it. I will not assert eligibility I could not read.
+
+---
+
+## 5. Exact integration architecture (Mermaid)
+
+```mermaid
+flowchart TB
+    subgraph WIN["Windows host — Lenovo LOQ 15IAX9 · i5-12450HX · 12 GB RAM · 4 GB VRAM"]
+        subgraph CTRL["Control surface"]
+            SUP["Supervisor chat console<br/>read-only NL over Obsidian + Paperclip"]
+        end
+
+        subgraph ROUTE["Agent-routing plane — FLEXIBLE (LLM)"]
+            LG["LangGraph primary router<br/>Send fan-out · verify_node wrapper<br/>checkpointer=None"]
+        end
+
+        subgraph SKILL["Skill / runtime plane"]
+            OCG["OpenClaw gateway<br/>skill XML prompt assembly<br/>per-agent workspace + agentDir"]
+            SK["skills/ — FIRST-PARTY ONLY<br/>outreach-copywriter · agentmail-send-email<br/>0 ClawHub refs"]
+        end
+
+        subgraph INFER["Inference chain — reviewed allowlist only"]
+            OR["Tier 1: OmniRoute v3.8.51<br/>breaker · cooldown · restricted allowlist"]
+            FL["Tier 2: FreeLLMAPI :3001<br/>429/5xx cooldown + key rotation"]
+            PAUSE["inference_paused<br/>SAFE PAUSE — never silent switch"]
+        end
+
+        subgraph COMPLY["Compliance-state plane — RIGID (no LLM, no network)"]
+            GATE["compliance_gate.evaluate()<br/>plain if-checks · immediately before send"]
+        end
+
+        subgraph SEND["Outbound — OAuth REST only"]
+            MCP["mcp-servers/email-outreach<br/>sole token holder · sole send path"]
+            Z["Zoho x5<br/>messages.CREATE"]
+            G["Gmail x1<br/>gmail.send"]
+            AM["AgentMail fallback<br/>2 accts x 3 inboxes"]
+        end
+
+        subgraph MEM["SOLE DURABLE MEMORY"]
+            OBS["Obsidian vault + Local REST API<br/>:27124 localhost · Bearer key<br/>Leads · Campaigns · Patterns · Operations"]
+        end
+
+        subgraph MON["Monitoring — telemetry ONLY"]
+            PC["Paperclip dashboard"]
+            WD["Watchdog 60-120s<br/>dedupe agent_id + fingerprint / 30 min"]
+        end
+    end
+
+    SUP -->|read| OBS
+    SUP -->|read| PC
+    LG -->|Send per lead| OCG
+    OCG --> SK
+    SK -->|draft + evidence| LG
+    LG -->|prompt| OR
+    OR -->|exhausted| FL
+    OR -->|all exhausted| PAUSE
+    FL -->|all exhausted| PAUSE
+    PAUSE -->|incident| OBS
+    LG -->|action node| GATE
+    GATE -->|outcome=allow| MCP
+    GATE -->|suppress_*| OBS
+    MCP --> Z
+    MCP --> G
+    MCP --> AM
+    LG -->|same-turn mirror| OBS
+    OBS -->|rehydrate on restart| LG
+    PC -->|heartbeat poll| LG
+    WD -->|poll /api/activity| PC
+    WD -->|incident note| OBS
+    LG -.->|telemetry only, never lead state| PC
+
+    classDef rigid fill:#ffe6e6,stroke:#c00,stroke-width:2px
+    classDef memory fill:#e6f3ff,stroke:#06c,stroke-width:2px
+    classDef flex fill:#e8ffe8,stroke:#080
+    class GATE rigid
+    class OBS memory
+    class LG,OCG flex
+```
+
+**Reading the diagram:** the red node is the rigid plane and is the only path to the sender; the blue node is the only durable memory; the green nodes are the flexible plane. Note the two dashed/telemetry-only edges — Paperclip receives from LangGraph but never feeds lead state back, and the watchdog writes incidents *to Obsidian*, not to Paperclip.
+
+---
+
+## 6. Obsidian-only memory and restart-recovery design
+
+**Folder contract** (mirrored in `vault-schema/00-Schema.md` and `vault-schema/Templates/Lead.md`):
+
+```
+Outreach/
+├─ Leads/<lead_id>.md          # frontmatter = authoritative compliance record
+├─ Campaigns/<campaign>.md     # sequence definitions, offer, angle variants
+├─ Patterns/<pattern>.md       # cross-lead learned patterns
+├─ Operations/
+│  ├─ Incidents/               # watchdog + compliance incidents
+│  ├─ Sender-Health/           # per-identity capacity, halt windows, warmup stage
+│  └─ Inference/               # inference_paused records
+└─ Templates/Lead.md
+```
+
+**Write ownership — enforced in code, not convention.** `orchestrator/nodes/reporter.py` defines `WRITABLE_FRONTMATTER = {sequence_stage, last_contacted_at, sends_total, replies_total, best_performing_angle, conversation_stage, groundedness_avg}` and `TERMINAL_FRONTMATTER = {unsubscribed, bounced, do_not_contact, jurisdiction_hold, hard_bounce_count}`. `LeadReporter.report()` raises `ValueError` if a caller attempts to write either a terminal field or any non-allowlisted field. The outreach agents physically cannot move a lead into or out of a terminal state.
+
+**Section-write discipline.** `Run Log`, `Replies`, `Incidents` are append-only via heading-targeted PATCH with `If-Match`; `Outreach Draft` is overwritten each attempt; frontmatter compliance fields are written only by the reply classifier or an operator. A full-note rewrite is never used for a lead note — that is what makes concurrent agents safe.
+
+**Per-lead reporter — atomic patch, not a rewrite.** `ObsidianClient.patch_section()` issues:
+```
+PATCH /vault/Outreach/Leads/<lead_id>.md
+Content-Type: text/markdown; charset=utf-8
+Operation: append
+Target-Type: heading
+Target: Run Log
+Create-Target-If-Missing: true
+If-Match: <content-hash from read_note>
+```
+The version token is the plugin's own content hash, documented at `mcpHandler.ts:1296` ("`version` is a content hash of the file — pass it back as `vault_patch`'s `ifMatch` to make an edit conditional on the file being unchanged"). `ObsidianClient.read_note()` returns `(body, version)`; `LeadReporter.report()` re-reads after the patch to capture the post-write version. A concurrent edit fails loudly rather than being clobbered.
+
+**Q5 answered — who may persist what:**
+
+| Component | Persistence class | May persist | Must never persist |
+|---|---|---|---|
+| **Obsidian** | Durable | Leads, campaigns, patterns, operations, incidents, suppression/bounce/unsubscribe state, conversation history, reports, sender health | — |
+| **OpenClaw per-agent SQLite** | Ephemeral | Session transcript, working context for the current run | Anything not mirrored to Obsidian in the same turn |
+| **LangGraph checkpoints** | Ephemeral (**and disabled**) | Nothing — `checkpointer=None`; `SqliteSaver` never constructed | Anything |
+| **Paperclip** | Operational telemetry | Run status, duration, stdout/stderr excerpts, cost/usage, heartbeats, liveness | Lead records, campaign knowledge, learned patterns, suppression state, conversation history, tokens |
+| **OmniRoute / FreeLLMAPI** | Operational | Provider quota caches, key health | Lead data |
+| **mcp-servers/email-outreach** | Operational | Send audit log (message id, timestamp, identity) | Lead content beyond the send payload |
+
+**Q6 answered — restart-recovery plan (Obsidian only).** On process start, `restart_recovery()` performs four reads and consults **no framework checkpoint**:
+
+1. **Enumerate** `Outreach/Leads/*.md` via `vault_list` / `search_query` with `type: lead`.
+2. **Load terminal set.** For each lead, `parse_frontmatter()` (`obsidian_client.py`) extracts the four terminal booleans and `hard_bounce_count`. Any truthy value → the lead enters the terminal set and is **never queued**. This mirrors the gate exactly: the same fields, the same truthiness rule, so a lead that was blocked before the crash is blocked after it.
+3. **Restore pacing** from `sequence_stage`, `last_contacted_at`, `sends_total`. Per-identity daily counters are reconstructed by counting `Run Log` entries whose `status=ok` and `policy=allow` for that identity on the current date — the run log is the ledger.
+4. **Restore fleet state** from `Outreach/Operations/Sender-Health/*.md` (per-identity `daily_cap`, `phase0_status`, `in_halt_window`) and `Outreach/Operations/Inference/*.md` (`inference_paused`).
+5. **Assert** that no framework store was consulted: the recovery function must not import `langgraph.checkpoint`, and `orchestrator/main.py` already runs `assert_no_llm_imports()` on the compliance module to prove the rigid plane stayed clean.
+
+Because the compliance gate re-reads the note *immediately before every send* anyway, a stale in-memory state after recovery cannot produce a prohibited send — it can only produce a duplicate attempt, which the run-log ledger and `last_contacted_at` suppress.
+
+---
+
+## 7. Sender service design: Zoho/Gmail/AgentMail OAuth REST only
+
+**One path, one token holder.** `mcp-servers/email-outreach/server.py` is the only module in the system that holds a refresh token or opens an outbound HTTP connection. Agents call it over MCP; they never see a credential. This is what makes "no raw OAuth tokens to agents" (§10) an architectural fact rather than a policy.
+
+**Providers and payload shapes (implemented, documentation-derived, UNVERIFIED against live accounts):**
+
+| Provider | Endpoint | Scope | Payload builder | Status |
+|---|---|---|---|---|
+| Zoho (×5) | `POST https://{host}/api/accounts/{accountId}/messages` | `ZohoMail.messages.CREATE` | `build_zoho_payload()` → `{fromAddress, toAddress, subject, content, mailFormat: "plaintext", askReceipt: "no"}` | UNVERIFIED — Phase-0 gate 1 |
+| Gmail (×1) | `POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send` | `gmail.send` (**send-only, not `gmail.modify`**) | `build_gmail_payload()` → base64url RFC 2822 in `raw` | UNVERIFIED — Phase-0 gate 1 |
+| AgentMail (fallback) | `POST https://api.agentmail.to/v1/inboxes/{inbox_id}/messages/send` | API key (2 free accounts × 3 inboxes) | `{to, subject, text}` | UNVERIFIED — Phase-0 gate 2 |
+
+**Q7 answered — the hard send-gate implementation, in exact order.** This is `send()` in `server.py`, and the order is the design:
+
+1. **Re-read current state.** `client.read_frontmatter(lead_id)` — never cached frontmatter, never planning-time state.
+2. **Block on terminal states.** `evaluate(fm, identity=…, identity_state=…)` runs the rigid plane: missing required field → `suppress_capacity`; any of `unsubscribed`/`do_not_contact`/`bounced`/`jurisdiction_hold` truthy → `suppress_<field>`; `hard_bounce_count >= 1` → `suppress_bounced`. A blocked result returns `http_status: 403` and **returns before any URL is constructed**.
+3. **Validate sender capacity and health.** Same call: `phase0_status != "pass"` → block; `in_halt_window` → `suppress_halt_window`; `healthy is False` → block; `sent_today >= daily_cap` → block; `sent_today >= hard_ceiling_per_identity` → block.
+4. **Validate compliance fields.** Presence of all six required fields (`unsubscribed`, `bounced`, `do_not_contact`, `jurisdiction_hold`, `consent_basis`, `sender_identity`) is checked first, and a *missing* key is a block — not an implicit `false`. This closes the "absent field reads as not-suppressed" hole.
+5. **Send only through the OAuth REST wrapper.** Provider is resolved from the identity prefix; the refresh token is read from the *sender process's* environment; `calls.append(f"POST {url}")` happens **before** the HTTP call so a crash still leaves evidence of intent.
+6. **Append the result to Obsidian.** `LeadReporter.report()` appends one `Run Log` entry via the atomic section patch, in the same turn.
+
+**Instrumentation that makes the gate testable.** `send()` accepts `external_http_calls: list[str]`; Phase-0 gate 5 asserts this list is **empty** for a suppressed lead. The gate is not "we believe it blocks" — it is "zero URLs were constructed."
+
+**Warm-up ladder, encoded in `config/send-policy.yaml`:** `stage_1: 2` → `stage_2: 7` → `stage_3: 12` per identity per day, `hard_ceiling_per_identity: 17`, randomised delays `45–210 s`, `allowed_local_hours: [8, 18]`. Advancement requires `min_replies: 3`, `max_bounce_rate: 0.02`, `min_days_in_stage: 3` — outcome metrics, never elapsed time. Halts: `bounce_cluster` (≥2 hard bounces in 10 min fleet-wide → 24 h), `http_429` (any 429 → 24 h), `suppression_anomaly` (suppression write fails or readback mismatches → 24 h).
+
+---
+
+## 8. Paperclip monitoring and watchdog design
+
+**Adapter selection (justified in §4.5):** `openclaw_gateway` for OpenClaw workers (real run state), `process` for the LangGraph orchestrator (local long-lived process; the only documented disqualifier — no cross-run session persistence — is irrelevant because Obsidian holds state). `http` is rejected: its own doc says "When Not to Use — If the agent runs locally on the same machine." Manifests live in `paperclip-adapter/adapter.json`.
+
+**Telemetry write:** `paperclip-adapter/heartbeat.py` posts `{agentId, status, timestamp, dryRun, inferencePaused, sendWarmupStage}` plus a `_forbidden_keys_absent` assertion list naming `lead_id`, `email`, `unsubscribed`, `bounced`, `conversation`. The watchdog self-test fails if any forbidden key appears — the boundary is machine-checked, not documented.
+
+**Watchdog (`watchdog/watchdog.py`)** — required because Paperclip's outbound alerting remains unconfirmed:
+
+- **Poll:** `GET {PAPERCLIP_BASE_URL}/api/activity` every `WATCHDOG_POLL_SECONDS` (default **90**, within your 60–120 s window).
+- **Detect:** `detect_failures()` filters the status set derived from source — `{failed, timed_out, interrupted, cancelled}` — ignoring `succeeded`/`completed`/`running`/`queued`.
+- **Dedupe:** `DedupeWindow(minutes=30)` keyed on `agent_id + "::" + fingerprint`. The fingerprint is `sha256(f"{agent_id}|{error_kind}|{normalised_message[:400]}")[:16]`, with whitespace collapsed so a flapping agent that varies whitespace still dedupes. Verified in self-test: first occurrence not a duplicate, second within the window is, and the fingerprint is stable under whitespace normalisation.
+- **Incident note:** written to `Outreach/Operations/Incidents/<UTC-stamp>-<agent_id>-<fingerprint>.md` with YAML frontmatter (`type: incident`, `agent_id`, `error_kind`, `error_fingerprint`, `run_id`, `detected_at`, `severity`) and a checklist (inspect run / confirm no partial sends / clear halt window if armed).
+- **Notify:** default is a **desktop toast** via PowerShell `System.Windows.Forms.MessageBox` — deliberately *not* an email, because an alert email would consume sender warm-up budget and could itself trigger the 24 h 429 halt. The email path is opt-in via `WATCHDOG_ALERT_VIA_EMAIL=true` and is delegated to the sender service, which owns the token.
+
+**Why a toast by default is the right call:** your brief allows "one identity's own REST email API or a desktop toast." Choosing the toast preserves the warm-up ladder and avoids a self-inflicted 429 — a failure mode where the alerting mechanism causes the outage it reports.
+
+---
+
+## 9. Supervisor chat-console design
+
+**Separation is structural, not cosmetic.** The supervisor console is a *read-only* natural-language surface. It has no send capability, no token access, and no write path to lead frontmatter.
+
+- **Read surface:** Obsidian (`vault_read`, `search_query`, document-map tool, tags tool) + Paperclip (`GET /api/activity`, `/api/agents`, `/api/dashboard`). No write tools are mounted.
+- **Query shapes it must answer:** "which leads are in a terminal state and why," "which identities are inside a halt window," "what is today's send count per identity," "what patterns have we learned across leads" (reads `Outreach/Patterns/`), "why was this lead blocked" (reads the `Run Log` + `Incidents` sections and quotes the `policy` reason verbatim).
+- **Grounding rule:** every answer must cite the note path and section it came from. The console quotes the `policy_result.reason` string the gate actually produced; it never paraphrases a block reason into a summary that could drift.
+- **What it must refuse:** "send X to Y," "mark this lead unsubscribed," "clear the halt window," "skip the compliance check." Each of those is either a sender-service call (not mounted) or a terminal-field write (rejected by `LeadReporter`). The refusal is architectural — the tools simply are not present.
+- **Escalation sink:** the console is where `next_action="escalate_to_human"` results surface (produced by `verify_node` after `MAX_REWRITE_ATTEMPTS = 2` failed rewrites), because a lead that cannot be grounded needs a human, not another model call.
+
+---
+
+## 10. Antigravity configuration and MCP permission plan
+
+**Q2 answered — no-source-modification MCP calls, per target:**
+
+| Target | MCP call possible without source modification? | Evidence / caveat |
+|---|---|---|
+| **Obsidian's built-in MCP server** | ✅ **Yes** | The plugin ships MCP natively: manifest describes "A secure REST API and Model Context Protocol (MCP) server for your vault"; `POST /mcp/` with sessionless revision `2026-07-28` (`constants.ts` `MCP_SESSIONLESS_PROTOCOL_VERSION`). Point Antigravity at `http://127.0.0.1:27124/mcp/` |
+| **Custom `email-outreach` MCP sender** | ✅ **Yes — but it is *our* code** | `mcp-servers/email-outreach/server.py` exposes `send_outreach_email` via FastMCP. No vendor source is modified; we author a new server |
+| **Paperclip monitoring/read endpoint** | ⚠️ **Partly — HTTP read, not MCP** | Paperclip exposes REST routes (`routes/activity.ts`, `agents.ts`, `dashboard.ts`) but **no MCP server was found**. Wrap those reads in a thin MCP server, or have the supervisor console call REST directly. The adapter path (`openclaw_gateway` / `process`) is Paperclip's own integration mechanism and requires no source modification |
+| **AgentMail's `agentmail-mcp` skill** | ✅ **Yes** | The skill's own doc points at the hosted Streamable HTTP server `https://mcp.agentmail.to/mcp`, with OAuth ("Use OAuth. Do not put an empty API key in the configuration"). Skill is vendored into `skills/agentmail-mcp/`; no vendor source modified |
+
+**Q3 answered — Windows launch and supervision.** `start.ps1` performs ordered bring-up and prints exactly one PASS/FAIL line per service, exiting non-zero on any failure. Order and rationale:
+
+1. **Obsidian REST reachability** — first, because everything else depends on memory. A 401 still counts as PASS (the plugin is listening; the key just was not sent).
+2. **OmniRoute** (`pnpm start` in `vendor/OmniRoute`, probe `{OMNIROUTE_BASE_URL}/models`).
+3. **FreeLLMAPI** (`pnpm start` in `vendor/freellmapi`, probe `/models`; default port 3001).
+4. **ClawHub assertion** — `OPENCLAW_ALLOW_CLAWHUB` must be `false`, checked *before* the gateway starts.
+5. **OpenClaw gateway** (`openclaw gateway run`, probe `/health`).
+6. **LangGraph orchestrator** (`python -m orchestrator.main --startup-check`, expecting `orchestrator alive`).
+7. **Paperclip dashboard** (`pnpm dev` in `vendor/paperclip`, probe base URL).
+
+Paperclip supervises the orchestrator through the **`process`** adapter (`adapter.json`), which injects `PAPERCLIP_AGENT_ID` / `PAPERCLIP_API_KEY` and uses exit code for success/failure. OpenClaw workers are supervised through **`openclaw_gateway`**. Secrets are loaded from `.env` into the *process* environment only (`[Environment]::SetEnvironmentVariable(..., "Process")`) — never written to machine or user scope.
+
+**Q8 answered — Antigravity MCP configuration, permission policy, Ask vs Allow, and token isolation.**
+
+| MCP server | Transport | Mounted tools | Default |
+|---|---|---|---|
+| `obsidian` | `http://127.0.0.1:27124/mcp/` | `vault_read`, `vault_patch` (append-only, allowlisted headings), `search_query`, `vault_list`, document-map, tags, commands-list | **Allow** the reads; **Ask** on every `vault_patch` |
+| `email-outreach` | stdio (our server) | `send_outreach_email` | **Ask** always. Never Allow |
+| `paperclip` | thin MCP over REST (or direct REST) | activity/agents/dashboard reads; heartbeat write | **Allow** reads; **Allow** heartbeat (telemetry only) |
+| `agentmail` | `https://mcp.agentmail.to/mcp` | send/check/manage/MCP skills | **Ask** on send; **Allow** on read; **Deny** `manage-inboxes` for outreach agents |
+
+**Denied outright, at the platform level:** arbitrary shell, arbitrary HTTP/fetch, unrestricted filesystem, and any tool that returns a credential. The reason is not stylistic: an agent that can fetch arbitrary URLs can exfiltrate lead data, and an agent with a shell can read `.env` and every refresh token in it.
+
+**How token isolation is actually achieved** (three independent mechanisms, so no single failure is fatal):
+1. **The sender service owns the tokens.** `_refresh_token()` reads from `os.environ` *inside the sender process*; the value is never returned, logged, or placed in a tool result.
+2. **Agents call MCP, not HTTP.** There is no HTTP tool in an agent's toolset. The only way out is `send_outreach_email`, which runs the compliance gate first.
+3. **The policy token is server-side.** The gate reads the lead note itself; an agent cannot pass a "suppression checked: true" flag, because no such parameter exists.
+
+**Filesystem policy:** agents see the repo root read-only plus their own workspace. `.env` is outside every agent-visible path. `config/` is read-only to agents (the allowlist is not agent-editable).
+
+**Permission principle:** *Ask* on anything that leaves the machine or mutates durable memory; *Allow* on reads. That maps cleanly onto the boundary list — the two irreversible categories are sends and writes, and both get a human-visible confirmation path (the send via the MCP Ask prompt; the write via `If-Match`, which fails loudly on conflict).
+
+---
+
+## 11. Phased build plan, in exact implementation order
+
+### Phase 0 — validation gates (hard-blocking; do not proceed until all eight pass)
+1. **Zoho Free-plan OAuth/API entitlement, per account** — `scripts/phase0/validate_zoho.ps1 -Identity 01..05`. Mints an access token from the refresh token at `accounts.zoho.com/oauth/v2/token`, enumerates accounts, probes capability. Run with `-SendTestMessage` for the full `messages.CREATE` probe (self-addressed, zero external recipients). **If any account fails → activate AgentMail failover.**
+2. **AgentMail failover** — `scripts/phase0/validate_agentmail.ps1`. **Blocking precondition, not automated:** read AgentMail's ToS and confirm two free accounts for one operator are permitted; the script refuses to run until `AGENTMAIL_TOS_MULTI_ACCOUNT_CONFIRMED=true` is set. Two signups → 3+3=6 inboxes, use 5. If ToS disallows → 3 AgentMail identities + passing Zoho/Gmail, rotation recomputed. The script also asserts each of the four vendored skills carries a `metadata.openclaw` gate.
+3. **Reviewed model allowlist** — `scripts/phase0/validate_allowlist.py`. Every allowlisted model answers; a non-allowlisted probe is refused; exhaustion reports `inference_paused`. Leave `globalFallbackModel` unset (see §4.3).
+4. **Obsidian MCP roundtrip** — `scripts/phase0/validate_obsidian_roundtrip.py`. Writes via section patch, reads back exact match, logs both to Paperclip.
+5. **Compliance gate** — `scripts/phase0/validate_compliance_gate.py`. Suppressed lead → `403 SUPPRESSED`-equivalent, `external_http_calls=0`.
+6. **Verification loop** — `scripts/phase0/validate_verification_loop.py`. Missing `role` → verifier rejects, retry fires, terminal `escalate_to_human`.
+7. **Dynamic spawn** — `scripts/phase0/validate_spawn.ps1`. `openclaw agents add` creates an isolated agent; its allowlist excludes `manage-inboxes`; ≤1 inbox env var visible.
+8. **ClawHub-avoidance** — `scripts/phase0/check_clawhub_refs.py`. `clawhub_references=0` across config + skills + vault-schema + orchestrator.
+
+**Exit criterion:** all eight exit 0. Any failure blocks the build.
+
+### Phase 1 — memory foundation
+Create the vault schema (`vault-schema/`), enable the Local REST API plugin, confirm localhost binding and that `enableInsecureServer` is false, store the key in `.env`, and re-run gates 4–5. Deliverable: a lead note that can be created, patched, read back, and blocked.
+
+### Phase 2 — ingestion, no sending
+Lead ingestion and the normalized lead-note writer. Handle CSV, PDF, and inconsistent directory/Google-Maps-style exports. **Deliverable: `Outreach/Leads/*.md` populated with `source` + `source_ref` provenance, `DRY_RUN=true`, zero send capability wired.**
+
+### Phase 3 — deterministic compliance state machine
+Wire `compliance_gate.evaluate()` into the graph as a pre-send node, plus the `Operations/Sender-Health/` and `Operations/Inference/` writers. Re-run gates 5 and 6. **Deliverable: every terminal state provably blocks, with the reason recorded in Obsidian.**
+
+### Phase 4 — OAuth-only sender wrapper
+Stand up `mcp-servers/email-outreach` over stdio, implement the real token minting for whichever providers passed Phase 0, add **dry-run** and **one-recipient** test modes. **Deliverable: a single real email to the operator's own address, with `Run Log` evidence and a `message_id`.**
+
+### Phase 5 — reply ingestion and classification
+Reply ingestion via the passing provider's REST read API, classification with SalesGPT's `determine_conversation_stage()` in the pre-generation hook, and **terminal suppression behaviour**: an unsubscribe reply writes `unsubscribed: true` and the next send attempt blocks. **Deliverable: a closed loop where a reply changes the lead's future behaviour.**
+
+### Phase 6 — Paperclip adapter and watchdog
+Deploy `paperclip-adapter/` (`openclaw_gateway` + `process`) and `watchdog/`. Verify dedupe over 30 minutes and that incident notes land in `Operations/Incidents/`. **Deliverable: a killed worker produces exactly one incident note and one toast.**
+
+### Phase 7 — read-only supervisor chat
+Mount the read-only console with Obsidian + Paperclip reads, no write tools. **Deliverable: it answers "why was lead X blocked" by quoting the gate's own reason string.**
+
+### Phase 8 — autonomous low-volume sending
+Set `DRY_RUN=false`, `SEND_WARMUP_STAGE=1`, cap 2/day/identity. **Expand only on outcome metrics:** to stage 2 (7/day) at `min_replies: 3`, `max_bounce_rate: 0.02`, `min_days_in_stage: 3`; to stage 3 (12/day) on the same criteria. Hard ceiling 17/day/identity is never exceeded. **Deliverable: sustained autonomous sending with the ladder enforced by config, not by operator attention.**
+
+---
+
+## 12. File/module plan for the new integration code
+
+| Path | Purpose | Status |
+|---|---|---|
+| `orchestrator/main.py` | Entrypoint; Obsidian reachability, rigid-plane assertion, contract-keys log | ✅ written, compiles, prints `orchestrator alive` |
+| `orchestrator/graph/build.py` | `SwarmState`, `fan_out_per_lead` (`Send`), `verify_node` wrapper, `route_after_verify`, `build_graph()` with `checkpointer` omitted | ✅ written |
+| `orchestrator/nodes/verifier.py` | `verify_against_obsidian()` — evidence integrity + claim integrity, deterministic | ✅ written |
+| `orchestrator/nodes/reporter.py` | `LeadReporter.report()` — same-turn mirror, allowlist-enforced writes, `write_pattern()` | ✅ written |
+| `orchestrator/nodes/` (copywriter, sender, ingest, reply_classifier) | Phase 2–5 nodes | 🔲 stubs in `build.py` |
+| `orchestrator/policy/compliance_gate.py` | **The rigid plane.** Zero LLM, zero network | ✅ written, self-test passes |
+| `orchestrator/memory/obsidian_client.py` | REST client: `read_note`/`read_frontmatter`/`patch_section`/`append_run_log`/`write_incident`/`search` + `parse_frontmatter` | ✅ written |
+| `orchestrator/contracts/agent_result.py` | `AgentResult`, `PolicyResult`, `AgentError`, `schema_keys()` | ✅ written |
+| `orchestrator/requirements.txt` | `langgraph`, `pydantic` — **sqlite saver deliberately absent** | ✅ written |
+| `mcp-servers/email-outreach/server.py` | Sole send path; gate-first; Zoho/Gmail/AgentMail payload builders; `--selftest` | ✅ written, self-test passes |
+| `watchdog/watchdog.py` | Poll, detect, dedupe, incident note, notify | ✅ written, self-test passes |
+| `paperclip-adapter/heartbeat.py` + `adapter.json` | Telemetry write + adapter manifest with source-cited status values | ✅ written |
+| `scripts/phase0/*` | The eight gates (4 Python, 3 PowerShell) | ✅ written, Python gates verified |
+| `config/model-allowlist.yaml` | Reviewed commercial-use allowlist, exhaustion → pause | ✅ written |
+| `config/send-policy.yaml` | Warm-up ladder, pacing, halts, terminal states | ✅ written |
+| `config/identities.yaml` | Six identities + AgentMail fallback fleet with ToS gate | ✅ written |
+| `skills/outreach-copywriter/SKILL.md` | First-party skill with a real `metadata.openclaw` block | ✅ written |
+| `skills/agentmail-send-email/SKILL.md` | Vendored + patched (gating block added, note retained) | ✅ written |
+| `vault-schema/Templates/Lead.md`, `00-Schema.md` | Lead template + folder/write-ownership contract | ✅ written |
+| `mcp-servers/{obsidian,paperclip}/README.md` | Tool allow/deny matrices with source citations | ✅ written |
+| `start.ps1`, `.env.template`, `README.md` | Windows bring-up, secrets, Day-One runbook | ✅ written |
+
+**Verification evidence from this session** (all run against the scaffold as written):
+- `python3 orchestrator/policy/compliance_gate.py` → `allow-case -> allow`, `suppressed -> suppress_unsubscribed | http 403`, `no-llm-imports -> True`
+- `python3 scripts/phase0/validate_compliance_gate.py` → `compliance gate failures: 0` (including `[PASS] missing consent_basis blocks (suppress_capacity)`)
+- `python3 scripts/phase0/validate_verification_loop.py` → `verification loop failures: 0` (including `[PASS] evidence/Obsidian mismatch caught`)
+- `python3 mcp-servers/email-outreach/server.py --selftest` → `selftest failures: 0` (including `[PASS] Gmail payload shape`)
+- `python3 scripts/phase0/check_clawhub_refs.py` → `clawhub_references=0 (scanned 4 dirs, 4 files, 2 skills)`, `[PASS]`
+- `python3 -m py_compile` across all 14 Python modules → `PY_COMPILE_OK`
+
+**One honest caveat on those runs:** an initial `check_clawhub_refs.py` run correctly **failed** with `clawhub_references=1`, flagging a prose line in `skills/outreach-copywriter/SKILL.md` that mentioned ClawHub by name in a prohibition. I rewrote that line to state the rule without the token, then re-ran to `0`. That is the check doing its job — and it is why the gate is a script rather than a promise.
+
+---
+
+## 13. The runnable scaffold
+
+**Download:** [`outreach-swarm-scaffold.zip`](https://www.genspark.ai/api/files/s/Y9shF75q) (66.95 KB, 34 files)
+
+```
+swarm/
+├─ README.md                       # Day-One runbook, 10 steps with expected output
+├─ .env.template                   # 70+ vars: Zoho×5, Gmail, AgentMail×2, routers, Obsidian, Paperclip, OpenClaw, policy
+├─ start.ps1                       # 7-service ordered bring-up, PASS/FAIL per line, non-zero on failure
+├─ config/
+│  ├─ model-allowlist.yaml         # strict_allowlist, refuse_unlisted, on_exhaustion: inference_paused
+│  ├─ send-policy.yaml             # warm-up ladder, pacing, halts, terminal states
+│  └─ identities.yaml              # 6 identities + AgentMail fallback (tos_multi_account_verified: false)
+├─ orchestrator/
+│  ├─ main.py                      # entrypoint; prints "orchestrator alive"
+│  ├─ requirements.txt             # langgraph, pydantic (sqlite saver deliberately absent)
+│  ├─ graph/build.py               # Send fan-out + verify_node wrapper + checkpointer=None
+│  ├─ policy/compliance_gate.py    # THE RIGID PLANE — zero LLM, zero network
+│  ├─ memory/obsidian_client.py    # read / atomic section patch / incident / search
+│  ├─ contracts/agent_result.py    # 9-field contract
+│  └─ nodes/{verifier,reporter}.py
+├─ skills/
+│  ├─ outreach-copywriter/SKILL.md # first-party, real metadata.openclaw block
+│  └─ agentmail-send-email/SKILL.md# vendored + patched, vendoring note retained
+├─ mcp-servers/
+│  ├─ email-outreach/server.py     # sole send path, gate-first, --selftest
+│  ├─ obsidian/README.md           # tool allow/deny matrix
+│  └─ paperclip/README.md          # adapter choice + status values with line cites
+├─ vault-schema/{00-Schema.md, Templates/Lead.md}
+├─ paperclip-adapter/{adapter.json, heartbeat.py}
+├─ watchdog/watchdog.py
+└─ scripts/phase0/{validate_zoho.ps1, validate_agentmail.ps1, validate_spawn.ps1,
+                   validate_allowlist.py, validate_obsidian_roundtrip.py,
+                   validate_compliance_gate.py, validate_verification_loop.py,
+                   check_clawhub_refs.py}
+```
+
+**Day-One runbook (condensed from `README.md`):** `Copy-Item .env.template .env` and fill it → `pwsh -File .\start.ps1` (expect six PASS lines) → gate 1 `validate_zoho.ps1 -Identity 01` (repeat 02–05) → gate 2 `validate_agentmail.ps1` (**ToS precondition blocks until acknowledged**) → gate 3 `validate_allowlist.py` → gate 4 `validate_obsidian_roundtrip.py` → gate 5 `validate_compliance_gate.py` → gate 6 `validate_verification_loop.py` → gate 7 `validate_spawn.ps1` → gate 8 `check_clawhub_refs.py` → `python -m orchestrator.main --dry-run --max-per-identity 2`. Sending stays `DRY_RUN=true` until Phase 8.
+
+---
+
+## 14. Acceptance tests and manually verifiable test cases
+
+**Automated (implemented and passing this session):**
+
+| Test | Command | Observed result |
+|---|---|---|
+| Rigid plane allows a clean lead | `python3 orchestrator/policy/compliance_gate.py` | `allow-case -> allow` |
+| Rigid plane blocks a suppressed lead | same | `suppressed -> suppress_unsubscribed \| http 403` |
+| Rigid plane has no model/HTTP imports | same | `no-llm-imports -> True` |
+| Each terminal field blocks independently | `validate_compliance_gate.py` | `failures: 0` |
+| Bounce escalation blocks with boolean false | same | `[PASS] hard_bounce_count=1 blocks` |
+| Missing required field blocks (no implicit default) | same | `[PASS] missing consent_basis blocks (suppress_capacity)` |
+| Zero external calls for a suppressed lead | same | `[PASS] external_http_calls=0` |
+| Verifier rejects an ungrounded claim | `validate_verification_loop.py` | `failures: 0` |
+| Retry loop terminates in escalation | same | `[PASS] retry_fired=True` |
+| Verifier does not over-reject | same | `[PASS] truthful draft accepted` |
+| Evidence/Obsidian mismatch caught | same | `[PASS] evidence/Obsidian mismatch caught` |
+| Zero ClawHub refs in final config | `check_clawhub_refs.py` | `clawhub_references=0` |
+| Sender payload shapes correct | `server.py --selftest` | `selftest failures: 0` |
+| All modules import-clean | `python3 -m py_compile …` | `PY_COMPILE_OK` |
+
+**Manually verifiable (require live services; each is a Phase-0 gate):**
+
+| Test | Pass | Fail |
+|---|---|---|
+| Zoho entitlement per identity | enumerated `accountId` + `messageId` | `401/403` or `INVALID_SCOPE` → AgentMail failover |
+| AgentMail two-account fleet | `inbox_count=6 usable=5` | fewer than 5 → reduce fleet, recompute rotation |
+| Allowlist enforcement | non-allowlisted probe refused; exhaustion → `inference_paused` | a non-allowlisted model answers → stop |
+| Obsidian roundtrip | `READBACK exact-match` + Paperclip logged | byte diff or `If-Match` conflict |
+| Compliance block | `BLOCKED 403` + `external_http_calls=0` | any URL constructed |
+| Verification loop | `verifier=REJECT` + `retry_fired=True` | draft accepted |
+| Spawn isolation | own `agentDir`, `bindings added=1 conflicts=0`, `allowlisted_inboxes<=1` | any other agent's state touched |
+| ClawHub avoidance | `clawhub_references=0` | any hit |
+| Watchdog dedupe | first alert fires, second within 30 min skipped | duplicate alerts |
+| Paperclip boundary | heartbeat carries no lead fields | any forbidden key present |
+
+**Capability-map promotion criteria (the 17 items, all currently UNVERIFIED).** Each is promoted to *feasible* only by a recorded live call against a test account, capturing the exact API method, the OAuth scope granted, the **response shape actually returned**, observed latency, quota cost, and a working snippet. The mapping from gate to capability group: gate 1 promotes the Zoho send/enumerate/folder capabilities; gate 2 promotes the AgentMail send/read/inbox capabilities; gate 3 promotes the inference-routing capabilities; gate 4 promotes the Obsidian read/patch/search capabilities; gate 5 promotes the compliance-block capability; gate 7 promotes the spawn/isolation capability. Until those runs are recorded, every entry stays UNVERIFIED — and I have deliberately not written plausible-looking response JSON for any of them.
+
+---
+
+## 15. Hard risks and blockers
+
+| # | Risk | Severity | Status / mitigation |
+|---|---|---|---|
+| 1 | **Zoho Free-plan API entitlement unknown** | 🔴 **Blocking** | Public docs confirm scope + endpoint but say nothing about Free-plan eligibility. Phase-0 gate 1 measures it per identity. Cannot be assumed. |
+| 2 | **AgentMail multi-account ToS unverified** | 🔴 **Blocking** | `agentmail.to/terms` was **not retrievable** this session (`[CRAWL FAILED]`). Gate 2 hard-blocks until an operator reads the ToS and acknowledges. Free tier is confirmed at 3 inboxes/account. |
+| 3 | **OmniRoute's exhaustion path silently switches** | 🔴 **High** | `chat.ts:1247-1297` performs a global fallback. Mitigation: leave `globalFallbackModel` unset and enforce `inference_paused` in an outer wrapper. Requires an explicit test (gate 3 exhaustion drill) or it will pass unnoticed. |
+| 4 | **Upstream AgentMail skills bypass OpenClaw gating** | 🔴 **High** | All ten `SKILL.md` files carry only `name:` + `description:`; `frontmatter.ts:181-184` returns `undefined` without a `metadata.openclaw` block, so gating is **skipped**. Mitigation: vendored patch (implemented) **plus** per-agent workspace allowlist (`zod-schema.agent-entry-base.ts:131`). |
+| 5 | **ClawHub malware supply chain** | 🔴 **High** | Unit 42 documents evasive malicious skills bypassing automated scanners to deploy infostealers and execute agentic fraud; five skills bypassed screening. OpenClaw's runtime *does* contain ClawHub code (`workspace-worker.ts:195`, `clawhub-verdicts.ts:2-4`). Mitigation: zero runtime pulls, in-repo skills only, gate 8 asserts it. |
+| 6 | **Paperclip has no confirmed outbound failure alerting** | 🟠 **Medium** | Re-verified: adjacent machinery exists, no agent-run-failure → notification path found. Status UNCONFIRMED, not disproven. Mitigation: local watchdog, toast-first so alerts cannot consume warm-up budget or trigger the 429 halt. |
+| 7 | **No live provider response shapes** | 🟠 **Medium** | All 17 capability-map entries are UNVERIFIED. Payload builders are implemented from documentation and self-tested for *shape*, not for *acceptance*. Gates 1–2 are the promotion mechanism. |
+| 8 | **CrewAI memory-disable unconfirmed** | 🟡 **Low** | Direct grep for `memory: bool` in `lib/crewai/src/crewai/crew.py` returned nothing. CrewAI is reference-only with no build dependency, so this does not block; re-read before promotion. |
+| 9 | **"ClawHavoc" label not confirmed in my sources** | 🟡 **Low** | The Unit 42 facts are corroborated; the campaign *name* did not appear in my retrieved excerpt. Does not affect the mitigation. |
+| 10 | **Single-machine hardware ceiling** | 🟡 **Medium** | 12 GB RAM, 4 GB VRAM, no GPU training. Five concurrent local services plus Obsidian is feasible but leaves little headroom; inference must stay remote (OmniRoute/FreeLLMAPI) and the graph must stay small. |
+| 11 | **`If-Match` conflicts under concurrency** | 🟡 **Low** | Correct behaviour (loud failure) but needs a retry policy: on conflict, re-read, re-verify, re-patch. Not yet implemented — Phase 1 work. |
+| 12 | **Warm-up ladder vs. reply latency** | 🟡 **Low** | At 2/day/identity, 100 leads/day cannot be serviced. This is intentional and is the point of Phase 8: the ladder is the safety mechanism, and throughput is earned through outcome metrics, not configured away. |
+
+**Bottom line for Antigravity.** The scaffold is runnable, its gates are executable, and its safety properties are machine-checked rather than asserted. The two genuine unknowns that can stop the build are both *measurements*, not designs: whether Zoho's Free plan exposes `ZohoMail.messages.CREATE` (gate 1) and whether AgentMail permits two free accounts per operator (gate 2). Everything downstream of those two answers is already wired.

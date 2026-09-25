@@ -1,0 +1,2 @@
+export const MAX_ACTIVE_REPORTS_PER_USER = 20;
+export const MAX_REPORT_REASON_LENGTH = 500;

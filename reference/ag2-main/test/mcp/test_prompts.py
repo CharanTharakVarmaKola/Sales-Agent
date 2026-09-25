@@ -1,0 +1,193 @@
+# Copyright (c) 2026, AG2ai, Inc., AG2ai open-source projects maintainers and core contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from mcp import ClientSession
+from mcp.server.lowlevel import NotificationOptions
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS, ErrorData, TextContent
+from mcp.types import PromptMessage as MCPPromptMessage
+
+from ag2.mcp import MCPServer, Prompt, PromptArgument, PromptMessage
+from ag2.mcp.errors import MCPPromptNotFoundError
+from ag2.mcp.prompts import PromptProvider
+from ag2.mcp.testing import connect, connect_modern
+
+from ._helpers import greeter
+
+
+@pytest.mark.asyncio
+class TestPromptGet:
+    async def test_string_render_becomes_user_message(self) -> None:
+        provider = PromptProvider([Prompt(name="greet", render=lambda a: f"Hello {a['name']}")])
+
+        result = await provider.get("greet", {"name": "Sam"})
+
+        [message] = result.messages
+        assert message.role == "user"
+        assert message.content.text == "Hello Sam"
+
+    async def test_async_render(self) -> None:
+        async def _render(_a: dict[str, str]) -> str:
+            return "async-prompt"
+
+        provider = PromptProvider([Prompt(name="p", render=_render)])
+
+        result = await provider.get("p", {})
+
+        assert result.messages[0].content.text == "async-prompt"
+
+    async def test_explicit_message_sequence(self) -> None:
+        provider = PromptProvider([
+            Prompt(
+                name="chat",
+                render=lambda _a: [
+                    PromptMessage(role="assistant", text="Hi!"),
+                    PromptMessage(role="user", text="Continue"),
+                ],
+            )
+        ])
+
+        result = await provider.get("chat", {})
+
+        assert [(m.role, m.content.text) for m in result.messages] == [("assistant", "Hi!"), ("user", "Continue")]
+
+    async def test_unknown_prompt_raises(self) -> None:
+        provider = PromptProvider([])
+
+        with pytest.raises(MCPPromptNotFoundError):
+            await provider.get("missing", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connect_client", [connect, connect_modern], ids=["handshake", "modern"])
+class TestPromptArguments:
+    @pytest.fixture(params=[Mock, AsyncMock], ids=["sync-render", "async-render"])
+    def render(self, request: pytest.FixtureRequest) -> Mock:
+        return request.param(return_value="rendered")
+
+    @pytest.fixture
+    def server(self, render: Mock) -> MCPServer:
+        return MCPServer(
+            greeter(),
+            prompts=[
+                Prompt(
+                    name="review",
+                    render=render,
+                    arguments=(
+                        PromptArgument(name="code", required=True),
+                        PromptArgument(name="language", required=True),
+                        PromptArgument(name="style"),
+                    ),
+                )
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        ("arguments", "missing"),
+        [
+            (None, "code, language"),
+            ({}, "code, language"),
+            ({"style": "brief"}, "code, language"),
+            ({"code": "print(1)"}, "language"),
+            ({"language": "python"}, "code"),
+        ],
+    )
+    async def test_missing_required_arguments_fail_before_rendering(
+        self,
+        connect_client: Callable[..., AbstractAsyncContextManager[ClientSession]],
+        server: MCPServer,
+        render: Mock,
+        arguments: dict[str, str] | None,
+        missing: str,
+    ) -> None:
+        async with connect_client(server, raise_exceptions=False) as session:
+            with pytest.raises(MCPError) as caught:
+                await session.get_prompt("review", arguments=arguments)
+
+        assert caught.value.error == ErrorData(
+            code=INVALID_PARAMS, message=f"Missing required arguments for prompt 'review': {missing}"
+        )
+        render.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"code": "print(1)", "language": "python"},
+            {"code": "", "language": ""},
+            {"code": "print(1)", "language": "python", "style": "brief"},
+        ],
+    )
+    async def test_supplied_required_arguments_reach_renderer(
+        self,
+        connect_client: Callable[..., AbstractAsyncContextManager[ClientSession]],
+        server: MCPServer,
+        render: Mock,
+        arguments: dict[str, str],
+    ) -> None:
+        async with connect_client(server) as session:
+            result = await session.get_prompt("review", arguments=arguments)
+
+        assert result.messages == [MCPPromptMessage(role="user", content=TextContent(type="text", text="rendered"))]
+        render.assert_called_once_with(arguments)
+
+    async def test_optional_arguments_can_be_omitted(
+        self,
+        connect_client: Callable[..., AbstractAsyncContextManager[ClientSession]],
+        render: Mock,
+    ) -> None:
+        server = MCPServer(
+            greeter(),
+            prompts=[Prompt(name="review", render=render, arguments=(PromptArgument(name="style"),))],
+        )
+
+        async with connect_client(server) as session:
+            result = await session.get_prompt("review")
+
+        assert result.messages == [MCPPromptMessage(role="user", content=TextContent(type="text", text="rendered"))]
+        render.assert_called_once_with({})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connect_client", [connect, connect_modern], ids=["handshake", "modern"])
+async def test_unknown_prompt_fails_with_invalid_params(
+    connect_client: Callable[..., AbstractAsyncContextManager[ClientSession]],
+) -> None:
+    render = Mock(return_value="rendered")
+    server = MCPServer(greeter(), prompts=[Prompt(name="review", render=render)])
+
+    async with connect_client(server, raise_exceptions=False) as session:
+        with pytest.raises(MCPError) as caught:
+            await session.get_prompt("missing")
+
+    assert caught.value.error == ErrorData(code=INVALID_PARAMS, message="No prompt named 'missing'.")
+    render.assert_not_called()
+
+
+def test_the_prompt_capability_is_advertised_only_when_prompts_are_present() -> None:
+    agent = greeter()
+    opts = NotificationOptions()
+
+    without = MCPServer(agent).server.get_capabilities(opts, {})
+    with_prompts = MCPServer(agent, prompts=[Prompt(name="greet", render=lambda _a: "hi")]).server.get_capabilities(
+        opts, {}
+    )
+
+    assert without.prompts is None
+    assert with_prompts.prompts is not None
+
+
+def test_prompt_argument_declaration() -> None:
+    prompt = Prompt(
+        name="greet",
+        render=lambda a: f"Hi {a['name']}",
+        arguments=(PromptArgument(name="name", description="who", required=True),),
+    )
+
+    assert prompt.arguments[0].name == "name"
+    assert prompt.arguments[0].required is True

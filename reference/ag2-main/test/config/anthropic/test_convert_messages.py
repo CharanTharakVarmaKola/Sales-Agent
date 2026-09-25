@@ -1,0 +1,1198 @@
+# Copyright (c) 2026, AG2ai, Inc., AG2ai open-source projects maintainers and core contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import base64
+import re
+from collections.abc import Callable
+from typing import Any
+
+import pytest
+from anthropic.types import (
+    BashCodeExecutionToolResultBlock,
+    ServerToolUseBlock,
+    TextEditorCodeExecutionToolResultBlock,
+    WebSearchToolResultBlock,
+)
+from anthropic.types.bash_code_execution_tool_result_error import BashCodeExecutionToolResultError
+from anthropic.types.text_editor_code_execution_tool_result_error import TextEditorCodeExecutionToolResultError
+from dirty_equals import IsPartialDict
+from fast_depends.use import SerializerCls
+
+from ag2 import ToolResult
+from ag2.compact import CompactionSummary
+from ag2.config.anthropic.events import AnthropicServerToolCallEvent, AnthropicServerToolResultEvent
+from ag2.config.anthropic.mappers import convert_messages
+from ag2.events import (
+    AudioInput,
+    BinaryInput,
+    BinaryType,
+    DocumentInput,
+    FileIdInput,
+    ImageInput,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextInput,
+    ToolCallEvent,
+    ToolCallsEvent,
+    ToolErrorEvent,
+    ToolNotFoundEvent,
+    ToolResultEvent,
+    ToolResultsEvent,
+    VideoInput,
+)
+from ag2.exceptions import ToolNotFoundError, UnsupportedInputError
+from ag2.files.types import FileProvider, UploadedFile
+
+
+def _model_response_with_tool_call(arguments: str | None) -> ModelResponse:
+    """Helper to build a ModelResponse containing a single tool call."""
+    return ModelResponse(
+        message=None,
+        tool_calls=ToolCallsEvent(
+            calls=[ToolCallEvent(id="tc_1", name="list_items", arguments=arguments)],
+        ),
+    )
+
+
+def _matching_tool_result(content: str = "ok") -> ToolResultsEvent:
+    """Companion ToolResultsEvent so the tool_use above isn't dropped as an orphan."""
+    return ToolResultsEvent(
+        results=[
+            ToolResultEvent(
+                parent_id="tc_1",
+                name="list_items",
+                result=ToolResult(content),
+            )
+        ],
+    )
+
+
+def _tool_results(result: ToolResult) -> ToolResultsEvent:
+    return ToolResultsEvent(results=[ToolResultEvent(parent_id="tc_1", name="t", result=result)])
+
+
+class TestConvertMessagesEmptyArguments:
+    """json.loads must not crash on empty or None tool call arguments."""
+
+    @pytest.mark.parametrize("arguments", ["", None])
+    def test_empty_arguments_produce_empty_dict(self, arguments: str | None) -> None:
+        response = _model_response_with_tool_call(arguments)
+        result = convert_messages([response, _matching_tool_result()], SerializerCls)
+
+        assert result[0] == IsPartialDict({
+            "role": "assistant",
+            "content": [IsPartialDict({"type": "tool_use", "id": "tc_1", "name": "list_items", "input": {}})],
+        })
+
+    def test_valid_arguments_are_preserved(self) -> None:
+        response = _model_response_with_tool_call('{"category": "books"}')
+        result = convert_messages([response, _matching_tool_result()], SerializerCls)
+
+        assert result[0] == IsPartialDict({
+            "content": [IsPartialDict({"type": "tool_use", "input": {"category": "books"}})],
+        })
+
+    def test_empty_object_arguments(self) -> None:
+        response = _model_response_with_tool_call("{}")
+        result = convert_messages([response, _matching_tool_result()], SerializerCls)
+
+        assert result[0] == IsPartialDict({
+            "content": [IsPartialDict({"type": "tool_use", "input": {}})],
+        })
+
+
+def test_full_sequence_with_empty_args() -> None:
+    """A request -> response-with-tool-call -> tool-result sequence should convert cleanly."""
+    events = [
+        ModelRequest([TextInput("What items do we have?")]),
+        _model_response_with_tool_call(""),
+        ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="list_items",
+                    result=ToolResult("apple, banana"),
+                )
+            ],
+        ),
+    ]
+    result = convert_messages(events, SerializerCls)
+
+    assert result[0] == IsPartialDict({"role": "user"})
+    assert result[1] == IsPartialDict({
+        "role": "assistant",
+        "content": [IsPartialDict({"input": {}})],
+    })
+    assert result[2] == IsPartialDict({
+        "role": "user",
+        "content": [IsPartialDict({"type": "tool_result"})],
+    })
+
+
+def test_image_url_input_converts_to_url_block() -> None:
+    image_url = "https://example.com/image.png"
+    result = convert_messages([ModelRequest([ImageInput(url=image_url)])], SerializerCls)
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "url", "url": image_url}}],
+        }
+    ]
+
+
+class TestImageBinaryInput:
+    SAMPLE_BYTES = b"\x89PNG\r\n\x1a\nfake"
+
+    def test_converts_to_image_base64_block(self) -> None:
+        result = convert_messages(
+            [ModelRequest([ImageInput(data=self.SAMPLE_BYTES, media_type="image/png")])], SerializerCls
+        )
+
+        expected_b64 = base64.b64encode(self.SAMPLE_BYTES).decode()
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": expected_b64},
+                    }
+                ],
+            }
+        ]
+
+    def test_vendor_metadata_cache_control_merges(self) -> None:
+        result = convert_messages(
+            [
+                ModelRequest([
+                    BinaryInput(
+                        data=self.SAMPLE_BYTES,
+                        media_type="image/png",
+                        vendor_metadata={"cache_control": {"type": "ephemeral"}},
+                        kind=BinaryType.IMAGE,
+                    )
+                ])
+            ],
+            SerializerCls,
+        )
+
+        assert result == [
+            IsPartialDict({
+                "role": "user",
+                "content": [IsPartialDict({"type": "image", "cache_control": {"type": "ephemeral"}})],
+            })
+        ]
+
+    @pytest.mark.parametrize("media_type", ["image/bmp", "image/tiff", "image/heic", "image/svg+xml"])
+    def test_rejects_media_type_the_api_refuses(self, media_type: str) -> None:
+        # The API answers these with `media_type: Input should be 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'`.
+        with pytest.raises(UnsupportedInputError, match=f"media_type={re.escape(media_type)}.*anthropic"):
+            convert_messages([ModelRequest([ImageInput(data=self.SAMPLE_BYTES, media_type=media_type)])], SerializerCls)
+
+    def test_rejects_citations(self) -> None:
+        # The API answers `image.citations: Extra inputs are not permitted`.
+        image = BinaryInput(
+            data=self.SAMPLE_BYTES,
+            media_type="image/png",
+            vendor_metadata={"citations": {"enabled": True}},
+            kind=BinaryType.IMAGE,
+        )
+
+        with pytest.raises(UnsupportedInputError, match="citations.*anthropic"):
+            convert_messages([ModelRequest([image])], SerializerCls)
+
+    def test_citations_none_reads_as_unset(self) -> None:
+        image = BinaryInput(
+            data=self.SAMPLE_BYTES, media_type="image/png", vendor_metadata={"citations": None}, kind=BinaryType.IMAGE
+        )
+
+        result = convert_messages([ModelRequest([image])], SerializerCls)
+
+        assert result == [{"role": "user", "content": [IsPartialDict({"type": "image"})]}]
+
+    def test_rejects_cache_control_the_api_refuses(self) -> None:
+        image = BinaryInput(
+            data=self.SAMPLE_BYTES,
+            media_type="image/png",
+            vendor_metadata={"cache_control": {"type": "persistent"}},
+            kind=BinaryType.IMAGE,
+        )
+
+        with pytest.raises(UnsupportedInputError, match="cache_control.*anthropic"):
+            convert_messages([ModelRequest([image])], SerializerCls)
+
+    @pytest.mark.parametrize("ttl", ["24h", ["5m"], {"value": "5m"}])
+    def test_rejects_cache_control_ttl_the_api_refuses(self, ttl: object) -> None:
+        image = BinaryInput(
+            data=self.SAMPLE_BYTES,
+            media_type="image/png",
+            vendor_metadata={"cache_control": {"type": "ephemeral", "ttl": ttl}},
+            kind=BinaryType.IMAGE,
+        )
+
+        with pytest.raises(UnsupportedInputError, match="cache_control.*anthropic"):
+            convert_messages([ModelRequest([image])], SerializerCls)
+
+    def test_cache_control_ttl_passes_through(self) -> None:
+        image = BinaryInput(
+            data=self.SAMPLE_BYTES,
+            media_type="image/png",
+            vendor_metadata={"cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            kind=BinaryType.IMAGE,
+        )
+
+        result = convert_messages([ModelRequest([image])], SerializerCls)
+
+        assert result == [
+            IsPartialDict({
+                "content": [IsPartialDict({"type": "image", "cache_control": {"type": "ephemeral", "ttl": "1h"}})],
+            })
+        ]
+
+    def test_vendor_metadata_filename_filtered_out(self) -> None:
+        result = convert_messages(
+            [
+                ModelRequest([
+                    BinaryInput(
+                        data=self.SAMPLE_BYTES,
+                        media_type="image/png",
+                        vendor_metadata={"filename": "photo.png"},
+                        kind=BinaryType.IMAGE,
+                    )
+                ])
+            ],
+            SerializerCls,
+        )
+
+        expected_b64 = base64.b64encode(self.SAMPLE_BYTES).decode()
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": expected_b64},
+                    }
+                ],
+            }
+        ]
+
+
+def test_document_url_input_converts_to_url_block() -> None:
+    doc_url = "https://example.com/doc.pdf"
+    result = convert_messages([ModelRequest([DocumentInput(url=doc_url)])], SerializerCls)
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [{"type": "document", "source": {"type": "url", "url": doc_url}}],
+        }
+    ]
+
+
+class TestDocumentBinaryInput:
+    SAMPLE_BYTES = b"%PDF-1.4"
+
+    def test_converts_to_document_base64_block(self) -> None:
+        result = convert_messages(
+            [ModelRequest([DocumentInput(data=self.SAMPLE_BYTES, media_type="application/pdf")])], SerializerCls
+        )
+
+        expected_b64 = base64.b64encode(self.SAMPLE_BYTES).decode()
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {"type": "base64", "media_type": "application/pdf", "data": expected_b64},
+                    }
+                ],
+            }
+        ]
+
+    def test_vendor_metadata_merges(self) -> None:
+        result = convert_messages(
+            [
+                ModelRequest([
+                    BinaryInput(
+                        data=self.SAMPLE_BYTES,
+                        media_type="application/pdf",
+                        vendor_metadata={"cache_control": {"type": "ephemeral"}},
+                        kind=BinaryType.DOCUMENT,
+                    )
+                ])
+            ],
+            SerializerCls,
+        )
+
+        assert result == [
+            IsPartialDict({
+                "role": "user",
+                "content": [IsPartialDict({"type": "document", "cache_control": {"type": "ephemeral"}})],
+            })
+        ]
+
+    def test_citations_pass_through(self) -> None:
+        document = BinaryInput(
+            data=self.SAMPLE_BYTES,
+            media_type="application/pdf",
+            vendor_metadata={"citations": {"enabled": True}},
+            kind=BinaryType.DOCUMENT,
+        )
+
+        result = convert_messages([ModelRequest([document])], SerializerCls)
+
+        assert result == [
+            IsPartialDict({"content": [IsPartialDict({"type": "document", "citations": {"enabled": True}})]})
+        ]
+
+    def test_plain_text_travels_as_a_text_source(self) -> None:
+        # A base64 `text/plain` source is answered `media_type: Input should be 'application/pdf'`.
+        result = convert_messages(
+            [ModelRequest([DocumentInput(data=b"The word is PELICAN.", media_type="text/plain")])],
+            SerializerCls,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {"type": "text", "media_type": "text/plain", "data": "The word is PELICAN."},
+                    }
+                ],
+            }
+        ]
+
+    def test_plain_text_that_is_not_utf8_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="text/plain.*anthropic"):
+            convert_messages([ModelRequest([DocumentInput(data=b"\xff\xfe", media_type="text/plain")])], SerializerCls)
+
+    @pytest.mark.parametrize("media_type", ["text/csv", "text/markdown", "application/json"])
+    def test_rejects_media_type_the_api_refuses(self, media_type: str) -> None:
+        with pytest.raises(UnsupportedInputError, match=f"media_type={re.escape(media_type)}.*anthropic"):
+            convert_messages([ModelRequest([DocumentInput(data=b"x", media_type=media_type)])], SerializerCls)
+
+
+class TestFileIdInput:
+    FILE_ID = "file_011CNha8iCJcU1wXNR6q4V8w"
+
+    def test_no_filename_defaults_to_document(self) -> None:
+        result = convert_messages([ModelRequest([FileIdInput(file_id=self.FILE_ID)])], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [{"type": "document", "source": {"type": "file", "file_id": self.FILE_ID}}],
+            }
+        ]
+
+    def test_image_filename_uses_image_block(self) -> None:
+        result = convert_messages(
+            [ModelRequest([FileIdInput(file_id=self.FILE_ID, filename="photo.jpg")])], SerializerCls
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [{"type": "image", "source": {"type": "file", "file_id": self.FILE_ID}}],
+            }
+        ]
+
+    def test_pdf_filename_uses_document_block(self) -> None:
+        result = convert_messages(
+            [ModelRequest([FileIdInput(file_id=self.FILE_ID, filename="report.pdf")])], SerializerCls
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [{"type": "document", "source": {"type": "file", "file_id": self.FILE_ID}}],
+            }
+        ]
+
+    def test_foreign_provider_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="'openai'.*anthropic"):
+            convert_messages(
+                [ModelRequest([UploadedFile(file_id="file-abc", provider=FileProvider.OPENAI)])],
+                SerializerCls,
+            )
+
+    def test_matching_provider_passes(self) -> None:
+        result = convert_messages(
+            [ModelRequest([UploadedFile(file_id=self.FILE_ID, provider=FileProvider.ANTHROPIC)])],
+            SerializerCls,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [{"type": "document", "source": {"type": "file", "file_id": self.FILE_ID}}],
+            }
+        ]
+
+
+def test_multiple_inputs_grouped_into_one_message() -> None:
+    result = convert_messages(
+        [
+            ModelRequest([
+                TextInput("Describe these images."),
+                ImageInput(url="https://example.com/a.png"),
+                ImageInput(url="https://example.com/b.jpg"),
+            ])
+        ],
+        SerializerCls,
+    )
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe these images."},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/b.jpg"}},
+            ],
+        }
+    ]
+
+
+class TestToolResult:
+    """Tool results can include image content blocks (binary + url)."""
+
+    PNG = b"\x89PNG\r\n"
+
+    def test_text_only_stays_string(self) -> None:
+        event = ToolResultsEvent(results=[ToolResultEvent(parent_id="tc_1", name="t", result=ToolResult("hello"))])
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tc_1", "content": "hello"}],
+            }
+        ]
+
+    def test_binary_image(self) -> None:
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult(ImageInput(data=self.PNG, media_type="image/png")),
+                )
+            ]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        expected_b64 = base64.b64encode(self.PNG).decode()
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/png", "data": expected_b64},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+    def test_url_image(self) -> None:
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult(ImageInput(url="https://example.com/a.png")),
+                )
+            ]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}],
+                    }
+                ],
+            }
+        ]
+
+    def test_mixed_text_and_image(self) -> None:
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult("here you go", ImageInput(data=self.PNG, media_type="image/png")),
+                )
+            ]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            IsPartialDict({
+                "role": "user",
+                "content": [
+                    IsPartialDict({
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [
+                            {"type": "text", "text": "here you go"},
+                            IsPartialDict({"type": "image"}),
+                        ],
+                    })
+                ],
+            })
+        ]
+
+    def test_binary_document(self) -> None:
+        pdf = b"%PDF-1.4 fake"
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult(DocumentInput(data=pdf, media_type="application/pdf")),
+                )
+            ]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        expected_b64 = base64.b64encode(pdf).decode()
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": expected_b64},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+    def test_url_document(self) -> None:
+        doc_url = "https://example.com/report.pdf"
+        event = ToolResultsEvent(
+            results=[ToolResultEvent(parent_id="tc_1", name="t", result=ToolResult(DocumentInput(url=doc_url)))]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [{"type": "document", "source": {"type": "url", "url": doc_url}}],
+                    }
+                ],
+            }
+        ]
+
+    def test_file_id_image(self) -> None:
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult(FileIdInput(file_id="file_abc", filename="photo.jpg")),
+                )
+            ]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [{"type": "image", "source": {"type": "file", "file_id": "file_abc"}}],
+                    }
+                ],
+            }
+        ]
+
+    def test_file_id_document(self) -> None:
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult(FileIdInput(file_id="file_xyz", filename="report.pdf")),
+                )
+            ]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [{"type": "document", "source": {"type": "file", "file_id": "file_xyz"}}],
+                    }
+                ],
+            }
+        ]
+
+    def test_file_id_no_filename_defaults_to_document(self) -> None:
+        event = ToolResultsEvent(
+            results=[ToolResultEvent(parent_id="tc_1", name="t", result=ToolResult(FileIdInput(file_id="file_plain")))]
+        )
+        result = convert_messages([event], SerializerCls)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [{"type": "document", "source": {"type": "file", "file_id": "file_plain"}}],
+                    }
+                ],
+            }
+        ]
+
+    def test_plain_text_document_travels_as_a_text_source(self) -> None:
+        result = convert_messages(
+            [_tool_results(ToolResult(DocumentInput(data=b"PELICAN", media_type="text/plain")))], SerializerCls
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc_1",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {"type": "text", "media_type": "text/plain", "data": "PELICAN"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+    def test_image_media_type_the_api_refuses_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="media_type=image/bmp.*anthropic"):
+            convert_messages([_tool_results(ToolResult(ImageInput(data=b"BM", media_type="image/bmp")))], SerializerCls)
+
+    def test_audio_in_tool_result_raises(self) -> None:
+        event = ToolResultsEvent(
+            results=[
+                ToolResultEvent(
+                    parent_id="tc_1",
+                    name="t",
+                    result=ToolResult(AudioInput(data=b"\x00audio", media_type="audio/wav")),
+                )
+            ]
+        )
+        with pytest.raises(UnsupportedInputError, match="BinaryInput.*audio.*anthropic"):
+            convert_messages([event], SerializerCls)
+
+
+@pytest.mark.parametrize(
+    ("input_factory", "match"),
+    [
+        pytest.param(
+            lambda: AudioInput(url="https://example.com/audio.wav"),
+            "UrlInput.*audio.*anthropic",
+            id="audio_url",
+        ),
+        pytest.param(
+            lambda: VideoInput(url="https://example.com/video.mp4"),
+            "UrlInput.*video.*anthropic",
+            id="video_url",
+        ),
+        pytest.param(
+            lambda: AudioInput(data=b"\x00audio", media_type="audio/wav"),
+            "BinaryInput.*audio.*anthropic",
+            id="audio_binary",
+        ),
+        pytest.param(
+            lambda: VideoInput(data=b"\x00video", media_type="video/mp4"),
+            "BinaryInput.*video.*anthropic",
+            id="video_binary",
+        ),
+        pytest.param(
+            lambda: BinaryInput(data=b"\x00", media_type="application/octet-stream", kind=BinaryType.BINARY),
+            "BinaryInput.*binary.*anthropic",
+            id="generic_binary",
+        ),
+    ],
+)
+def test_unsupported_input_raises(input_factory: Callable[[], Any], match: str) -> None:
+    with pytest.raises(UnsupportedInputError, match=match):
+        convert_messages([ModelRequest([input_factory()])], SerializerCls)
+
+
+def _server_tool_use_block(
+    *,
+    id: str = "stu_1",
+    name: str = "web_search",
+    input: dict | None = None,
+) -> ServerToolUseBlock:
+    return ServerToolUseBlock(
+        id=id,
+        name=name,
+        input=input if input is not None else {"query": "bitcoin price"},
+        type="server_tool_use",
+    )
+
+
+def _web_search_result_block(
+    *,
+    tool_use_id: str = "stu_1",
+    content: list | None = None,
+) -> WebSearchToolResultBlock:
+    return WebSearchToolResultBlock(
+        tool_use_id=tool_use_id,
+        type="web_search_tool_result",
+        content=content if content is not None else [],
+    )
+
+
+class TestAnthropicServerToolCallEvent:
+    def test_emits_wrapped_sdk_block_as_assistant_content(self) -> None:
+        block = _server_tool_use_block()
+        result = convert_messages(
+            [
+                AnthropicServerToolCallEvent(
+                    id=block.id,
+                    name="web_search",
+                    arguments="{}",
+                    block=block,
+                ),
+            ],
+            SerializerCls,
+        )
+
+        assert result == [{"role": "assistant", "content": [block.model_dump(exclude_none=True, mode="json")]}]
+
+    def test_appends_to_existing_assistant_message(self) -> None:
+        block = _server_tool_use_block(input={"query": "test"})
+        result = convert_messages(
+            [
+                ModelResponse(message=ModelMessage("Let me search for that."), tool_calls=ToolCallsEvent()),
+                AnthropicServerToolCallEvent(id=block.id, name="web_search", arguments="{}", block=block),
+            ],
+            SerializerCls,
+        )
+
+        assert result == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me search for that."},
+                    block.model_dump(exclude_none=True, mode="json"),
+                ],
+            }
+        ]
+
+
+class TestAnthropicServerToolResultEvent:
+    def test_emits_wrapped_sdk_block_as_assistant_content(self) -> None:
+        block = _web_search_result_block()
+        result = convert_messages(
+            [
+                AnthropicServerToolResultEvent(
+                    parent_id=block.tool_use_id,
+                    name="web_search",
+                    result=ToolResult(),
+                    block=block,
+                ),
+            ],
+            SerializerCls,
+        )
+
+        assert result == [{"role": "assistant", "content": [block.model_dump(exclude_none=True, mode="json")]}]
+
+    def test_call_and_result_blocks_stack_into_one_assistant_message(self) -> None:
+        call_block = _server_tool_use_block(input={"query": "test"})
+        result_block = _web_search_result_block()
+        result = convert_messages(
+            [
+                AnthropicServerToolCallEvent(id=call_block.id, name="web_search", arguments="{}", block=call_block),
+                AnthropicServerToolResultEvent(
+                    parent_id=result_block.tool_use_id,
+                    name="web_search",
+                    result=ToolResult(),
+                    block=result_block,
+                ),
+            ],
+            SerializerCls,
+        )
+
+        assert result == [
+            {
+                "role": "assistant",
+                "content": [
+                    call_block.model_dump(exclude_none=True, mode="json"),
+                    result_block.model_dump(exclude_none=True, mode="json"),
+                ],
+            }
+        ]
+
+
+def test_full_sequence_round_trip() -> None:
+    """ModelRequest -> call+result -> ModelResponse -> ModelRequest."""
+    call_block = _server_tool_use_block(input={"query": "bitcoin"})
+    result_block = _web_search_result_block()
+    events = [
+        ModelRequest([TextInput("Search for bitcoin price")]),
+        AnthropicServerToolCallEvent(id=call_block.id, name="web_search", arguments="{}", block=call_block),
+        AnthropicServerToolResultEvent(
+            parent_id=result_block.tool_use_id,
+            name="web_search",
+            result=ToolResult(),
+            block=result_block,
+        ),
+        ModelResponse(message=ModelMessage("Bitcoin is $74,000."), tool_calls=ToolCallsEvent()),
+        ModelRequest([TextInput("What was the exact price?")]),
+    ]
+
+    result = convert_messages(events, SerializerCls)
+
+    assert result == [
+        {"role": "user", "content": "Search for bitcoin price"},
+        {
+            "role": "assistant",
+            "content": [
+                call_block.model_dump(exclude_none=True, mode="json"),
+                result_block.model_dump(exclude_none=True, mode="json"),
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "Bitcoin is $74,000."}]},
+        {"role": "user", "content": "What was the exact price?"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("call_block", "result_block"),
+    [
+        pytest.param(
+            ServerToolUseBlock(
+                id="stu_1",
+                name="bash_code_execution",
+                input={"command": "echo hello"},
+                type="server_tool_use",
+            ),
+            BashCodeExecutionToolResultBlock(
+                tool_use_id="stu_1",
+                type="bash_code_execution_tool_result",
+                content=BashCodeExecutionToolResultError(
+                    error_code="unavailable",
+                    type="bash_code_execution_tool_result_error",
+                ),
+            ),
+            id="bash",
+        ),
+        pytest.param(
+            ServerToolUseBlock(
+                id="stu_2",
+                name="text_editor_code_execution",
+                input={"command": "view", "path": "/a.txt"},
+                type="server_tool_use",
+            ),
+            TextEditorCodeExecutionToolResultBlock(
+                tool_use_id="stu_2",
+                type="text_editor_code_execution_tool_result",
+                content=TextEditorCodeExecutionToolResultError(
+                    error_code="file_not_found",
+                    type="text_editor_code_execution_tool_result_error",
+                ),
+            ),
+            id="text_editor",
+        ),
+    ],
+)
+def test_code_execution_subtool_preserves_block_shape(
+    call_block: ServerToolUseBlock,
+    result_block: Any,
+) -> None:
+    """Anthropic's code_execution tool reports results via sub-tool-specific block
+    types. The typed event preserves the original block shape so replay stays lossless."""
+    result = convert_messages(
+        [
+            AnthropicServerToolCallEvent(id=call_block.id, name="code_execution", arguments="{}", block=call_block),
+            AnthropicServerToolResultEvent(
+                parent_id=result_block.tool_use_id, name="code_execution", result=ToolResult(), block=result_block
+            ),
+        ],
+        SerializerCls,
+    )
+
+    assert result == [
+        {
+            "role": "assistant",
+            "content": [
+                call_block.model_dump(exclude_none=True, mode="json"),
+                result_block.model_dump(exclude_none=True, mode="json"),
+            ],
+        }
+    ]
+
+
+class TestUnsupportedInputs:
+    def test_audio_url_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="UrlInput.*audio.*anthropic"):
+            convert_messages([ModelRequest([AudioInput(url="https://example.com/audio.wav")])], SerializerCls)
+
+    def test_video_url_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="UrlInput.*video.*anthropic"):
+            convert_messages([ModelRequest([VideoInput(url="https://example.com/video.mp4")])], SerializerCls)
+
+    def test_audio_binary_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="BinaryInput.*audio.*anthropic"):
+            convert_messages([ModelRequest([AudioInput(data=b"\x00audio", media_type="audio/wav")])], SerializerCls)
+
+    def test_video_binary_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="BinaryInput.*video.*anthropic"):
+            convert_messages([ModelRequest([VideoInput(data=b"\x00video", media_type="video/mp4")])], SerializerCls)
+
+    def test_generic_binary_raises(self) -> None:
+        with pytest.raises(UnsupportedInputError, match="BinaryInput.*binary.*anthropic"):
+            convert_messages(
+                [
+                    ModelRequest([
+                        BinaryInput(data=b"\x00", media_type="application/octet-stream", kind=BinaryType.BINARY)
+                    ])
+                ],
+                SerializerCls,
+            )
+
+
+def test_hallucinated_tool_call_maps_with_error_text() -> None:
+    # Regression: a not-found tool call used to leave result=None and crash on r.result.parts.
+    call = ToolCallEvent(id="tc_1", name="ghost_tool")
+    event = ToolResultsEvent(results=[ToolNotFoundEvent.from_call(call, ToolNotFoundError("ghost_tool"))])
+
+    result = convert_messages([event], SerializerCls)
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tc_1",
+                    "content": "ag2.exceptions.ToolNotFoundError: Tool `ghost_tool` not found\n",
+                    # ToolNotFoundEvent is a ToolErrorEvent: the model must see a failure.
+                    "is_error": True,
+                }
+            ],
+        }
+    ]
+
+
+def test_compaction_summary_renders_as_user_turn() -> None:
+    summary = CompactionSummary(summary="Looked up Paris and Tokyo.", event_count=6)
+
+    result = convert_messages([summary], SerializerCls)
+
+    assert result == [{"role": "user", "content": "[Summary of earlier conversation]\nLooked up Paris and Tokyo."}]
+
+
+class TestLooseToolResultEvent:
+    """A ToolResultEvent that arrives without its ToolResultsEvent wrapper.
+
+    mappers.py handles this because the wrapper can fail to persist; the
+    fallback must render the same block the wrapped path does.
+    """
+
+    PNG = b"\x89PNG\r\n"
+
+    def test_text_result_renders(self) -> None:
+        events = [
+            _model_response_with_tool_call('{"n": 1}'),
+            ToolResultEvent(parent_id="tc_1", result=ToolResult("ok")),
+        ]
+
+        assert convert_messages(events, SerializerCls)[-1] == {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tc_1", "content": "ok"}],
+        }
+
+    def test_non_text_parts_render_like_the_wrapped_path(self) -> None:
+        image = ImageInput(data=self.PNG, media_type="image/png")
+        wrapped = convert_messages(
+            [
+                _model_response_with_tool_call(None),
+                ToolResultsEvent(results=[ToolResultEvent(parent_id="tc_1", result=ToolResult(image))]),
+            ],
+            SerializerCls,
+        )
+        loose = convert_messages(
+            [_model_response_with_tool_call(None), ToolResultEvent(parent_id="tc_1", result=ToolResult(image))],
+            SerializerCls,
+        )
+
+        assert loose == wrapped
+
+    def test_tool_error_event_renders(self) -> None:
+        error = ToolErrorEvent.from_call(ToolCallEvent(id="tc_1", name="list_items"), ValueError("boom"))
+        events = [_model_response_with_tool_call(None), error]
+
+        assert convert_messages(events, SerializerCls)[-1] == {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tc_1", "content": "ValueError: boom\n", "is_error": True}
+            ],
+        }
+
+    def test_wrapper_still_wins_when_both_are_present(self) -> None:
+        loose = ToolResultEvent(parent_id="tc_1", result=ToolResult("ok"))
+        events = [_model_response_with_tool_call(None), loose, _matching_tool_result()]
+
+        results = [m for m in convert_messages(events, SerializerCls) if m["role"] == "user"]
+        assert len(results) == 1
+
+
+class TestToolErrorIsError:
+    """A failed tool must reach the model as ``is_error``, not as a successful result."""
+
+    def test_error_sets_is_error(self) -> None:
+        error = ToolErrorEvent.from_call(ToolCallEvent(id="tc_1", name="t"), ValueError("boom"))
+
+        assert convert_messages([ToolResultsEvent(results=[error])], SerializerCls) == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tc_1", "content": "ValueError: boom\n", "is_error": True}
+                ],
+            }
+        ]
+
+    def test_success_has_no_is_error(self) -> None:
+        ok = ToolResultEvent(parent_id="tc_1", name="t", result=ToolResult("fine"))
+
+        assert convert_messages([ToolResultsEvent(results=[ok])], SerializerCls) == [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tc_1", "content": "fine"}]}
+        ]
+
+    def test_loose_error_sets_is_error(self) -> None:
+        error = ToolErrorEvent.from_call(ToolCallEvent(id="tc_1", name="list_items"), ValueError("boom"))
+
+        assert convert_messages([_model_response_with_tool_call(None), error], SerializerCls)[-1] == {
+            "role": "user",
+            "content": [IsPartialDict({"tool_use_id": "tc_1", "is_error": True})],
+        }
+
+
+class TestToolUseVendorMetadata:
+    """``caller`` and ``toolset_name`` ride on ToolCallEvent.vendor_metadata.
+
+    ``caller`` says whether the model asked directly or a server tool did (the
+    ``allowed_callers`` feature of ``bash_20250124``). ``toolset_name`` is
+    mandatory on the way back for a browser/computer member tool: the API answers
+    400 "a tool_result answering a member tool_use must carry the paired
+    tool_use's toolset_name". Both round-trip cleanly (verified live).
+    """
+
+    def _response(self, **vendor: object) -> ModelResponse:
+        return ModelResponse(
+            message=None,
+            tool_calls=ToolCallsEvent(
+                calls=[ToolCallEvent(id="tc_1", name="navigate", arguments="{}", vendor_metadata=dict(vendor))],
+            ),
+        )
+
+    def test_caller_replays_on_the_tool_use(self) -> None:
+        events = [
+            self._response(caller={"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}),
+            _matching_tool_result(),
+        ]
+
+        assert convert_messages(events, SerializerCls)[0] == {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tc_1",
+                    "name": "navigate",
+                    "input": {},
+                    "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"},
+                }
+            ],
+        }
+
+    def test_toolset_name_replays_on_both_sides(self) -> None:
+        events = [self._response(toolset_name="browser"), _matching_tool_result()]
+
+        assert convert_messages(events, SerializerCls) == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tc_1", "name": "navigate", "input": {}, "toolset_name": "browser"}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tc_1", "content": "ok", "toolset_name": "browser"}],
+            },
+        ]
+
+    def test_empty_toolset_name_is_read_the_same_on_both_sides(self) -> None:
+        events = [self._response(toolset_name=""), _matching_tool_result()]
+
+        use, result = convert_messages(events, SerializerCls)
+
+        assert use["content"] == [IsPartialDict({"type": "tool_use", "toolset_name": ""})]
+        assert result["content"] == [IsPartialDict({"type": "tool_result", "toolset_name": ""})]
+
+    def test_caller_the_sdk_does_not_model_raises(self) -> None:
+        events = [self._response(caller={"type": "somebody_else"}), _matching_tool_result()]
+
+        with pytest.raises(UnsupportedInputError, match="caller.*anthropic"):
+            convert_messages(events, SerializerCls)
+
+    def test_toolset_name_that_is_not_a_string_raises(self) -> None:
+        events = [self._response(toolset_name=["browser"]), _matching_tool_result()]
+
+        with pytest.raises(UnsupportedInputError, match="toolset_name.*anthropic"):
+            convert_messages(events, SerializerCls)
+
+    def test_orphan_with_a_bad_toolset_name_is_still_dropped(self) -> None:
+        orphan = self._response(toolset_name=["browser"])
+
+        assert convert_messages([orphan], SerializerCls) == []
+
+    def test_nothing_added_when_absent(self) -> None:
+        events = [self._response(), _matching_tool_result()]
+
+        assert convert_messages(events, SerializerCls) == [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tc_1", "name": "navigate", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tc_1", "content": "ok"}]},
+        ]
