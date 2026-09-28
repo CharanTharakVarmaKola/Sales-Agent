@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="__THEME_CSS__">
+<title>Orchestrator — Control Room</title>
+</head>
+<body>
+<a class="sr" href="#main">Skip to content</a>
+<div class="shell">
+<aside class="sidebar" aria-label="Sections">
+<div class="brand">Control Room<span class="brandcap">Outreach swarm</span></div>
+<nav>
+<div class='navcap' aria-hidden='true'>OVERVIEW</div>
+<a href='/machine' aria-current='false'><span class='navico' aria-hidden='true'></span>Machine</a>
+<div class='navcap' aria-hidden='true'>AGENTS</div>
+<a href='/orchestrator' aria-current='page'><span class='navico' aria-hidden='true'></span>Orchestrator</a>
+<a href='/agent-queue' aria-current='false'><span class='navico' aria-hidden='true'></span>Agent Queue <span class='countbadge' data-badge='queue' aria-label='count'></span></a>
+<a href='/agents' aria-current='false'><span class='navico' aria-hidden='true'></span>Agents</a>
+<div class='navcap' aria-hidden='true'>PIPELINE</div>
+<a href='/leads' aria-current='false'><span class='navico' aria-hidden='true'></span>Leads / CRM</a>
+<a href='/email' aria-current='false'><span class='navico' aria-hidden='true'></span>Email</a>
+<a href='/ledger' aria-current='false'><span class='navico' aria-hidden='true'></span>Ledger</a>
+<div class='navcap' aria-hidden='true'>SYSTEM</div>
+<a href='/llm' aria-current='false'><span class='navico' aria-hidden='true'></span>LLM</a>
+<a href='/logs' aria-current='false'><span class='navico' aria-hidden='true'></span>Logs <span class='countbadge' data-badge='logs' aria-label='count'></span></a>
+<a href='/compliance' aria-current='false'><span class='navico' aria-hidden='true'></span>Compliance <span class='countbadge' data-badge='compliance' aria-label='count'></span></a>
+</nav>
+<div class='sidefoot muted'>v0.1-rebuild</div>
+</aside>
+<main id="main">
+<div class="topbar">
+<div><strong>Orchestrator</strong><div class="muted">What is the brain doing, and can I talk to it</div></div>
+<label class="demoswitch"><input type="checkbox" data-demo-switch> Demo data</label>
+<span data-demo-pill></span>
+<span class="statuspill" role="status" data-bind="status-pill">…</span>
+<button type="button" data-bell aria-label="Backend issues" aria-expanded="false">!</button>
+<div data-bell-list hidden></div>
+<a href="/machine?theme=__TOGGLE__" role="button" aria-label="Switch theme">Toggle theme</a>
+<button type="button" class="estop" data-kill>EMERGENCY STOP</button>
+</div>
+<div data-stop-banner></div>
+<div data-stale></div>
+<div class="card"><h2>Standing</h2><div data-bind="standing"></div>
+<table><tbody data-bind="gates"></tbody></table></div>
+<div class="card"><h2>Last close</h2><div data-bind="last-close"></div></div>
+<div class="card"><h2>Cycle timeline (events/day)</h2><table><tbody data-bind="timeline"></tbody></table></div>
+<div class="card askmode"><h2>Ask the orchestrator</h2>
+<p class="muted">Ask mode — answers come from the ledger only. Nothing here can change machine state.</p>
+<form class="ask" action="/api/bot" method="get" data-bot-form>
+<label class="field" for="oq">Question</label>
+<input id="oq" name="q" type="text" size="50" placeholder="e.g. what is omniroute's posture">
+<button class="primary" type="submit">Ask</button></form>
+<div data-bot-answer aria-live="polite"></div></div>
+<div class="card instructmode"><h2>Instruct — dormant</h2>
+<p class="muted">Instruct mode is rendered but dormant: the backend write channel (lead-list upload, direct instruction) does not exist yet. Controls disabled with reason.</p>
+<form class="ask"><label class="field" for="up">Lead list upload (dormant — no write channel)</label>
+<input id="up" name="f" type="text" disabled aria-disabled="true" placeholder="upload disabled">
+<button type="button" disabled aria-disabled="true" title="Dormant: no backend write channel">Send instruction</button></form></div>
+</main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

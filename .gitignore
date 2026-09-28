@@ -29,3 +29,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# SQLite / local state (never commit live-smoke DBs or vault output)
+*.db
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+/live-smoke*.db
+vault/
