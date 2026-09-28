@@ -1,1 +1,7 @@
-langgraph
+# First-party runtime is stdlib-only (sqlite3, urllib, smtplib, http.server).
+# Test + migration tooling (pinned by usage, not guesses):
+# - tests/*.py and dashboard/test_dashboard.py import pytest
+# - migrations/versions/*.py import sqlalchemy + alembic
+pytest
+sqlalchemy
+alembic

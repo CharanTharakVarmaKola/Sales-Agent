@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="__THEME_CSS__">
+<title>Machine — Control Room</title>
+</head>
+<body>
+<a class="sr" href="#main">Skip to content</a>
+<div class="shell">
+<aside class="sidebar" aria-label="Sections">
+<div class="brand">Control Room<span class="brandcap">Outreach swarm</span></div>
+<nav>
+<div class='navcap' aria-hidden='true'>OVERVIEW</div>
+<a href='/machine' aria-current='page'><span class='navico' aria-hidden='true'></span>Machine</a>
+<div class='navcap' aria-hidden='true'>AGENTS</div>
+<a href='/orchestrator' aria-current='false'><span class='navico' aria-hidden='true'></span>Orchestrator</a>
+<a href='/agent-queue' aria-current='false'><span class='navico' aria-hidden='true'></span>Agent Queue <span class='countbadge' data-badge='queue' aria-label='count'></span></a>
+<a href='/agents' aria-current='false'><span class='navico' aria-hidden='true'></span>Agents</a>
+<div class='navcap' aria-hidden='true'>PIPELINE</div>
+<a href='/leads' aria-current='false'><span class='navico' aria-hidden='true'></span>Leads / CRM</a>
+<a href='/email' aria-current='false'><span class='navico' aria-hidden='true'></span>Email</a>
+<a href='/ledger' aria-current='false'><span class='navico' aria-hidden='true'></span>Ledger</a>
+<div class='navcap' aria-hidden='true'>SYSTEM</div>
+<a href='/llm' aria-current='false'><span class='navico' aria-hidden='true'></span>LLM</a>
+<a href='/logs' aria-current='false'><span class='navico' aria-hidden='true'></span>Logs <span class='countbadge' data-badge='logs' aria-label='count'></span></a>
+<a href='/compliance' aria-current='false'><span class='navico' aria-hidden='true'></span>Compliance <span class='countbadge' data-badge='compliance' aria-label='count'></span></a>
+</nav>
+<div class='sidefoot muted'>v0.1-rebuild</div>
+</aside>
+<main id="main">
+<div class="topbar">
+<div><strong>Machine</strong><div class="muted">Is everything fine, what is happening, what needs me</div></div>
+<label class="demoswitch"><input type="checkbox" data-demo-switch> Demo data</label>
+<span data-demo-pill></span>
+<span class="statuspill" role="status" data-bind="status-pill">…</span>
+<button type="button" data-bell aria-label="Backend issues" aria-expanded="false">!</button>
+<div data-bell-list hidden></div>
+<a href="/machine?theme=__TOGGLE__" role="button" aria-label="Switch theme">Toggle theme</a>
+<button type="button" class="estop" data-kill>EMERGENCY STOP</button>
+</div>
+<div data-stop-banner></div>
+<div data-stale></div>
+<div class="card banner-card" data-bind="status-banner" role="status"><div class="empty">Checking status…</div></div>
+<div class="card"><h2>Pipeline today</h2><div class="pipestrip" data-bind="pipeline"><div class="skel"></div><div class="skel"></div></div></div>
+<div class="grid" data-bind="kpis"></div>
+<div class="cols-7-5">
+<div class="card"><h2>Live activity</h2><div data-bind="activity"><div class="skel"></div><div class="skel"></div></div>
+<p><a href="/logs">Open Logs</a></p></div>
+<div class="card"><h2>Needs attention</h2><div data-bind="attention"><div class="skel"></div></div></div>
+</div>
+<div class="card"><h2>Component health</h2><div class="grid" data-bind="components"></div></div>
+</main>
+</div>
+<script src="/app.js"></script>
+<script src="/machine.js"></script>
+</body>
+</html>
